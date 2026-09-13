@@ -98,8 +98,8 @@ class McpServerTest(IsolatedTestCase):
         missing = self.call(proc, 2, "shunt_read", {"files": ["/nope.py"], "question": "q"})
         self.assertTrue(missing["isError"])
         self.assertIn("not found", missing["content"][0]["text"])
-        bad_args = self.call(proc, 3, "shunt_read", {"files": "not-a-list", "question": "q"})
-        self.assertTrue(bad_args["isError"])
+        bad_args = self.call(proc, 3, "shunt_read", {"files": ["/a.py"], "question": 42})
+        self.assertIn("argument question must be a valid string", bad_args["content"][0]["text"])
         missing_arg = self.call(proc, 4, "shunt_read", {"files": ["/a.py"]})
         self.assertIn("missing required argument: question", missing_arg["content"][0]["text"])
         extra = self.call(proc, 5, "shunt_read", {"files": ["/a.py"], "question": "q", "bogus": 1})
@@ -134,6 +134,14 @@ class McpServerTest(IsolatedTestCase):
         self.assertTrue(again["isError"])
         stats = self.call(proc, 4, "shunt_stats", {})
         self.assertIn("Delegated writes", stats["content"][0]["text"])
+
+    def test_lenient_argument_types(self):
+        path = self.make("a.py", 10)
+        proc = self.initialized()
+        for msg_id, files in ((2, json.dumps([str(path)])), (3, str(path))):
+            result = self.call(proc, msg_id, "shunt_read", {"files": files, "question": "q", "max_output": "64"})
+            self.assertFalse(result["isError"], result)
+        self.assertEqual(self.server.chat_requests()[-1]["body"]["options"]["num_predict"], 64)
 
     def test_unknown_tool(self):
         proc = self.initialized()

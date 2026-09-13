@@ -91,6 +91,28 @@ class InvalidArguments(ValueError):
     pass
 
 
+def _coerce_args(name: str, args: dict) -> dict:
+    """Repair common client mistakes: arrays sent as JSON strings or a single path,
+    numbers and booleans sent as strings."""
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
+    fixed = dict(args)
+    for key, value in args.items():
+        expected = schema["properties"].get(key, {}).get("type")
+        if not isinstance(value, str):
+            continue
+        if expected == "array":
+            try:
+                decoded = json.loads(value)
+            except ValueError:
+                decoded = None
+            fixed[key] = decoded if isinstance(decoded, list) else [value]
+        elif expected == "integer" and value.strip().isdigit():
+            fixed[key] = int(value)
+        elif expected == "boolean" and value.lower() in ("true", "false"):
+            fixed[key] = value.lower() == "true"
+    return fixed
+
+
 def _check_args(name: str, args: dict) -> None:
     schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
     props = schema["properties"]
@@ -113,6 +135,7 @@ def _check_args(name: str, args: dict) -> None:
 
 
 def call_tool(name: str, args: dict) -> dict:
+    args = _coerce_args(name, args)
     try:
         _check_args(name, args)
     except InvalidArguments as e:

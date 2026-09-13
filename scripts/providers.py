@@ -55,7 +55,13 @@ def _error_message(body: str) -> str:
         return body.strip()[:500]
     error = data.get("error", data) if isinstance(data, dict) else data
     if isinstance(error, dict):
-        error = error.get("message") or json.dumps(error)
+        message = error.get("message") or json.dumps(error)
+        # OpenRouter puts the upstream provider's explanation in metadata.
+        metadata = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+        detail = metadata.get("raw") or metadata.get("reason")
+        if detail:
+            message = f"{message} ({metadata.get('provider_name') or 'upstream'}: {str(detail)[:300]})"
+        error = message
     return str(error)[:500]
 
 

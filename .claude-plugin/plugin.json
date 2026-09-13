@@ -1,0 +1,8 @@
+{
+  "name": "local-shunt",
+  "version": "0.1.0",
+  "description": "Delegate large file reads to a local Ollama model to save Claude tokens",
+  "author": { "name": "<YOUR_NAME>" },
+  "license": "MIT",
+  "keywords": ["ollama", "tokens", "hooks", "local-llm"]
+}

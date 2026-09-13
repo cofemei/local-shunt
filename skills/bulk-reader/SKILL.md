@@ -1,15 +1,18 @@
 ---
 name: bulk-reader
-description: Answer a question about large files by delegating the reading to a local Ollama model. Use when a Read of a large file was blocked by local-shunt, or before reading one or more large files (roughly 350+ lines) when you need specific facts from them rather than their exact text.
+description: Answer a question about large files by delegating the reading to a worker model (local Ollama or a configured API such as OpenRouter). Use when a Read of a large file was blocked by local-shunt, or before reading one or more large files (roughly 350+ lines) when you need specific facts from them rather than their exact text.
 allowed-tools:
   - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" read *)
+  - mcp__plugin_local-shunt_local-shunt__shunt_read
 ---
 
 # bulk-reader
 
-A local model reads the files and returns a short answer with line references. You spend tokens on the answer, not on the whole file.
+A worker model reads the files and returns a short answer with line references. You spend tokens on the answer, not on the whole file.
 
-## Command
+## Tool or command
+
+If the `shunt_read` MCP tool is available, call it with `files` (absolute paths) and `question`. Otherwise run:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" read <file>... --question "<specific question>"
@@ -17,11 +20,11 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" read <file>... --question "<spe
 
 - Pass every file the question involves in one call.
 - Set the Bash timeout to 600000 ms for files over about 2,000 lines; the model may split them into parts.
-- Options: `--max-output <tokens>` (default 1024) for questions that need long lists; `--model <name>` to override the model.
+- Options: `--max-output <tokens>` (default 1024) for questions that need long lists; `--model <name>` and `--provider <name>` to override the configured worker. The MCP tool accepts the same options as `max_output`, `model` and `provider`.
 
 ## Ask specific questions
 
-The local model is small. It answers narrow questions well and broad ones poorly.
+The worker model is usually small. It answers narrow questions well and broad ones poorly.
 
 | Weak | Strong |
 |---|---|
@@ -48,4 +51,4 @@ Read the exact text with `offset`/`limit` instead when you:
 
 ## If the command fails
 
-Exit code 1 means Ollama failed; exit code 2 means bad arguments or an unsupported file. Do not retry the same call more than once. Fall back to Grep and Read with offset/limit.
+Exit code 1 (or an MCP tool error mentioning "Fall back") means the worker failed; exit code 2 means bad arguments or an unsupported file. Do not retry the same call more than once. Fall back to Grep and Read with offset/limit.

@@ -1,15 +1,18 @@
 ---
 name: code-writer
-description: Generate a new boilerplate file (test scaffolding, fixtures, type definitions, data classes, repetitive code following an existing example) with a local Ollama model instead of writing it token by token. Use only for structured, easily verified code; never for business logic, concurrency or security-sensitive code.
+description: Generate a new boilerplate file (test scaffolding, fixtures, type definitions, data classes, repetitive code following an existing example) with a worker model (local Ollama or a configured API) instead of writing it token by token. Use only for structured, easily verified code; never for business logic, concurrency or security-sensitive code.
 allowed-tools:
   - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" write *)
+  - mcp__plugin_local-shunt_local-shunt__shunt_write
 ---
 
 # code-writer
 
-A local model writes one file from your specification. The command prints only the path and line count, so the generated code does not enter your context unless you read it.
+A worker model writes one file from your specification. The command prints only the path and line count, so the generated code does not enter your context unless you read it.
 
-## Command
+## Tool or command
+
+If the `shunt_write` MCP tool is available, call it with `out`, `spec` and optionally `context` and `force`. Otherwise run:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" write \

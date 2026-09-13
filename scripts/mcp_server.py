@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""local-shunt MCP server (stdio, newline-delimited JSON-RPC 2.0).
+
+Exposes the worker as MCP tools: shunt_read, shunt_write, shunt_stats.
+Standard library only. Progress messages go to stderr; stdout carries protocol only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from common import PROVIDERS, apply_overrides, load_config  # noqa: E402
+from shunt import execute, run_read, run_stats, run_write  # noqa: E402
+
+SERVER_INFO = {"name": "local-shunt", "version": "0.2.0"}
+LATEST_PROTOCOL = "2025-06-18"
+
+MODEL_PROPS = {
+    "provider": {"type": "string", "enum": sorted(PROVIDERS), "description": "Override the configured provider."},
+    "model": {"type": "string", "description": "Override the configured model."},
+    "max_output": {"type": "integer", "minimum": 1, "description": "Output token limit."},
+}
+
+TOOLS = [
+    {
+        "name": "shunt_read",
+        "description": (
+            "Answer a specific question about one or more large text files by delegating the reading to a "
+            "worker model (local Ollama or a configured API). Returns a short answer with line ranges and a "
+            "'Not covered or uncertain' section, instead of the whole file. Ask narrow questions. The output "
+            "is an unverified summary: spot-check key claims with Read and offset/limit, and read exact text "
+            "yourself before editing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array", "items": {"type": "string"}, "minItems": 1,
+                    "description": "File paths. Prefer absolute paths.",
+                },
+                "question": {"type": "string", "description": "The specific question to answer from the files."},
+                **MODEL_PROPS,
+            },
+            "required": ["files", "question"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "shunt_write",
+        "description": (
+            "Generate one new boilerplate file (test scaffolding, fixtures, type definitions, repetitive code "
+            "following an example) with the worker model and write it to disk. Returns only the path and line "
+            "count. Refuses to overwrite unless force is true. Not for business logic, concurrency or "
+            "security-sensitive code. Run tests or a linter on the result."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "out": {"type": "string", "description": "Output file path. Prefer an absolute path."},
+                "spec": {"type": "string", "description": "What to generate: signatures, test cases, conventions."},
+                "context": {"type": "array", "items": {"type": "string"}, "description": "Files to imitate or test."},
+                "force": {"type": "boolean", "description": "Overwrite an existing file.", "default": False},
+                **MODEL_PROPS,
+            },
+            "required": ["out", "spec"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "shunt_stats",
+        "description": "Summarize local-shunt usage: hook decisions, delegated reads and writes, estimated token savings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string", "description": "Only records on or after this date (YYYY-MM-DD)."},
+                "session": {"type": "string", "description": "Only records from this Claude session ID."},
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+TOOL_NAMES = {tool["name"] for tool in TOOLS}
+
+
+class InvalidArguments(ValueError):
+    pass
+
+
+def _check_args(name: str, args: dict) -> None:
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
+    props = schema["properties"]
+    unknown = set(args) - set(props)
+    if unknown:
+        raise InvalidArguments(f"unknown argument(s): {', '.join(sorted(unknown))}")
+    for key in schema.get("required", []):
+        if key not in args:
+            raise InvalidArguments(f"missing required argument: {key}")
+    types = {"string": str, "integer": int, "boolean": bool, "array": list}
+    for key, value in args.items():
+        expected = props[key]["type"]
+        ok = isinstance(value, types[expected]) and not (expected == "integer" and isinstance(value, bool))
+        if ok and expected == "array":
+            ok = all(isinstance(item, str) for item in value)
+        if ok and "enum" in props[key]:
+            ok = value in props[key]["enum"]
+        if not ok:
+            raise InvalidArguments(f"argument {key} must be a valid {expected}")
+
+
+def call_tool(name: str, args: dict) -> dict:
+    try:
+        _check_args(name, args)
+    except InvalidArguments as e:
+        return {"content": [{"type": "text", "text": f"local-shunt: {e}"}], "isError": True}
+
+    cfg = apply_overrides(load_config(), args.get("provider"), args.get("model"))
+    if name == "shunt_read":
+        command, run = "read", lambda: run_read(cfg, args["files"], args["question"], args.get("max_output"))
+    elif name == "shunt_write":
+        command, run = "write", lambda: run_write(
+            cfg, args["out"], args["spec"], args.get("context"), bool(args.get("force")), args.get("max_output")
+        )
+    else:
+        command, run = "stats", lambda: run_stats(args.get("since"), args.get("session"))
+    code, text = execute(command, cfg, run)
+    return {"content": [{"type": "text", "text": text}], "isError": code != 0}
+
+
+def handle(message: dict) -> dict | None:
+    """Handle one JSON-RPC message. Returns the response, or None for notifications."""
+    method = message.get("method")
+    msg_id = message.get("id")
+    is_request = "id" in message
+    params = message.get("params") or {}
+
+    def result(value: dict) -> dict:
+        return {"jsonrpc": "2.0", "id": msg_id, "result": value}
+
+    def error(code: int, text: str) -> dict:
+        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": text}}
+
+    if not is_request:
+        return None  # notifications/initialized, notifications/cancelled, ...
+    if not isinstance(method, str):
+        return error(-32600, "invalid request")
+    if method == "initialize":
+        requested = params.get("protocolVersion")
+        return result({
+            "protocolVersion": requested if isinstance(requested, str) and requested else LATEST_PROTOCOL,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": SERVER_INFO,
+            "instructions": (
+                "Use shunt_read instead of reading large files in full when you need specific facts from them. "
+                "Use Read with offset/limit for exact text."
+            ),
+        })
+    if method == "ping":
+        return result({})
+    if method == "tools/list":
+        return result({"tools": TOOLS})
+    if method == "tools/call":
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name not in TOOL_NAMES:
+            return error(-32602, f"unknown tool: {name}")
+        if not isinstance(args, dict):
+            return error(-32602, "arguments must be an object")
+        return result(call_tool(name, args))
+    return error(-32601, f"method not found: {method}")
+
+
+def main() -> int:
+    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    if project and Path(project).is_dir():
+        os.chdir(project)  # resolve relative paths against the project
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            if isinstance(message, dict):
+                try:
+                    response = handle(message)
+                except Exception as e:  # keep the server alive
+                    response = {"jsonrpc": "2.0", "id": message.get("id"), "error": {"code": -32603, "message": str(e)}}
+            else:
+                response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "batches are not supported"}}
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

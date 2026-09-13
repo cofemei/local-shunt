@@ -1,5 +1,5 @@
 {
-  "description": "local-shunt: block full reads of large text files and point Claude to the local Ollama worker",
+  "description": "local-shunt: block full reads of large text files and point Claude to the worker model",
   "hooks": {
     "PreToolUse": [
       {

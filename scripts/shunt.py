@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """local-shunt worker CLI.
 
-    shunt.py read <file>... --question "..." [--model NAME] [--max-output N]
-    shunt.py write --out PATH --spec "..." [--context FILE...] [--force]
+    shunt.py read <file>... --question "..." [--provider NAME] [--model NAME] [--max-output N]
+    shunt.py write --out PATH --spec "..." [--context FILE...] [--force] [--provider NAME] [--model NAME]
     shunt.py stats [--since YYYY-MM-DD] [--session ID]
 """
 
@@ -21,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
     PLUGIN_ROOT,
+    PROVIDERS,
     Config,
+    apply_overrides,
     estimate_tokens,
     inspect_file,
     load_config,
@@ -29,7 +31,7 @@ from common import (  # noqa: E402
     now_ms,
     state_dir,
 )
-from ollama_client import OllamaError, chat  # noqa: E402
+from providers import LLMError, Provider, get_provider  # noqa: E402
 
 CHUNK_OVERLAP_LINES = 50
 EXIT_USAGE = 2
@@ -40,12 +42,34 @@ class UsageError(Exception):
     pass
 
 
+@dataclass
+class Usage:
+    prompt_tokens: int | None = None
+    output_tokens: int | None = None
+    cost: float | None = None
+
+    def add(self, result) -> None:
+        if result.cost is not None:
+            self.cost = (self.cost or 0) + result.cost
+        if result.prompt_tokens is not None:
+            self.prompt_tokens = (self.prompt_tokens or 0) + result.prompt_tokens
+        if result.output_tokens is not None:
+            self.output_tokens = (self.output_tokens or 0) + result.output_tokens
+
+
 def load_prompt(name: str) -> str:
     return (PLUGIN_ROOT / "prompts" / name).read_text(encoding="utf-8")
 
 
 def progress(message: str) -> None:
     print(f"[local-shunt] {message}", file=sys.stderr, flush=True)
+
+
+def resolve_path(raw: str) -> Path:
+    path = Path(os.path.expanduser(raw))
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
 
 
 def display_path(path: Path) -> str:
@@ -83,7 +107,7 @@ class Chunk:
 def load_sources(paths: list[str], cfg: Config) -> list[SourceFile]:
     sources = []
     for raw in paths:
-        path = Path(os.path.expanduser(raw)).resolve()
+        path = resolve_path(raw)
         info = inspect_file(path)
         if info is None:
             raise UsageError(f"{raw}: file not found or unreadable")
@@ -184,8 +208,11 @@ def validate_line_refs(text: str, sources: list[SourceFile]) -> tuple[str, int]:
     return "\n".join(out_lines), removed
 
 
-def reduce_findings(cfg: Config, question: str, findings: list[tuple[str, str]], max_output: int) -> tuple[str, int]:
+def reduce_findings(
+    llm: Provider, question: str, findings: list[tuple[str, str]], max_output: int, usage: Usage | None = None
+) -> tuple[str, int]:
     """Merge (label, text) findings, batching when they exceed the context budget."""
+    cfg = llm.cfg
     system = load_prompt("read_reduce.md")
     budget = int(cfg.num_ctx * 0.6) - estimate_tokens(system) - max_output
     calls = 0
@@ -204,7 +231,9 @@ def reduce_findings(cfg: Config, question: str, findings: list[tuple[str, str]],
         for i, batch in enumerate(batches, 1):
             body = "\n\n".join(f"## Part: {label}\n{text}" for label, text in batch)
             progress(f"merging findings ({i}/{len(batches)})")
-            result = chat(cfg, system, f"Question: {question}\n\n{body}", max_output)
+            result = llm.chat(system, f"Question: {question}\n\n{body}", max_output)
+            if usage is not None:
+                usage.add(result)
             calls += 1
             labels = "; ".join(label for label, _ in batch)
             merged.append((labels, result.text))
@@ -213,14 +242,18 @@ def reduce_findings(cfg: Config, question: str, findings: list[tuple[str, str]],
         findings = merged
 
 
-def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
+def run_read(cfg: Config, files: list[str], question: str, max_output: int | None = None) -> str:
     started = now_ms()
-    sources = load_sources(args.files, cfg)
-    system = load_prompt("read.md")
-    max_output = args.max_output or cfg.max_output
-    question = args.question.strip()
+    question = (question or "").strip()
     if not question:
-        raise UsageError("--question must not be empty")
+        raise UsageError("question must not be empty")
+    if not files:
+        raise UsageError("at least one file is required")
+    sources = load_sources(files, cfg)
+    system = load_prompt("read.md")
+    max_output = max_output or cfg.max_output
+    llm = get_provider(cfg)
+    usage = Usage()
 
     fixed = estimate_tokens(system + question) + 50
     single_budget = int(cfg.num_ctx * 0.6) - fixed - max_output
@@ -236,7 +269,8 @@ def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
     truncated = False
     if len(chunks) == 1:
         progress(f"asking {cfg.model} (~{est_input:,} tokens)")
-        result = chat(cfg, system, f"Question: {question}\n\n{chunks[0].render()}", max_output)
+        result = llm.chat(system, f"Question: {question}\n\n{chunks[0].render()}", max_output)
+        usage.add(result)
         answer, calls, truncated = result.text, 1, result.truncated
     else:
         findings = []
@@ -248,20 +282,21 @@ def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
                 "Answer from this part only; list what this part does not show under 'Not covered or uncertain'.\n\n"
                 f"{chunk.render()}"
             )
-            result = chat(cfg, system, user, max_output)
+            result = llm.chat(system, user, max_output)
+            usage.add(result)
             truncated = truncated or result.truncated
             findings.append((chunk.describe(), result.text))
-        answer, reduce_calls = reduce_findings(cfg, question, findings, max_output)
+        answer, reduce_calls = reduce_findings(llm, question, findings, max_output, usage)
         calls = len(chunks) + reduce_calls
 
     if not answer.strip():
-        raise OllamaError("the model returned an empty response")
+        raise LLMError("the model returned an empty response")
     answer, removed = validate_line_refs(answer, sources)
 
     elapsed = (now_ms() - started) / 1000
     title = ", ".join(f"{src.shown} ({len(src.lines):,} lines)" for src in sources)
     notes = [
-        f"model {cfg.model}",
+        f"{cfg.provider} {cfg.model}",
         f"~{est_input:,} tokens of source -> ~{estimate_tokens(answer):,} tokens",
         f"{len(chunks)} part{'s' if len(chunks) > 1 else ''}",
         f"{elapsed:.1f} s",
@@ -271,7 +306,6 @@ def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
     if truncated:
         notes.append("output hit --max-output and may be cut off")
     output = f"## local-shunt: {title}\n\n{answer}\n\n---\n" + " · ".join(notes)
-    print(output)
 
     log_event({
         "session_id": os.environ.get("CLAUDE_SESSION_ID"),
@@ -281,6 +315,10 @@ def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
         "bytes": sum(src.bytes for src in sources),
         "est_input_tokens": est_input,
         "est_output_tokens": estimate_tokens(output),
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "cost_usd": usage.cost,
+        "provider": cfg.provider,
         "model": cfg.model,
         "chunks": len(chunks),
         "calls": calls,
@@ -288,7 +326,7 @@ def cmd_read(args: argparse.Namespace, cfg: Config) -> int:
         "latency_ms": int(elapsed * 1000),
         "outcome": "ok",
     })
-    return 0
+    return output
 
 
 # ---------------------------------------------------------------- write
@@ -306,23 +344,33 @@ def strip_code_fence(text: str) -> str:
     return stripped
 
 
-def cmd_write(args: argparse.Namespace, cfg: Config) -> int:
+def run_write(
+    cfg: Config,
+    out: str,
+    spec: str,
+    context: list[str] | None = None,
+    force: bool = False,
+    max_output: int | None = None,
+) -> str:
     started = now_ms()
-    out = Path(os.path.expanduser(args.out)).resolve()
-    if out.exists() and not args.force:
-        raise UsageError(f"{args.out} already exists; pass --force to overwrite")
-    if out.exists() and not out.is_file():
-        raise UsageError(f"{args.out} is not a regular file")
-    if not args.spec.strip():
-        raise UsageError("--spec must not be empty")
+    if not out:
+        raise UsageError("out must not be empty")
+    raw_out = out
+    out_path = resolve_path(out)
+    if out_path.exists() and not force:
+        raise UsageError(f"{raw_out} already exists; pass --force to overwrite")
+    if out_path.exists() and not out_path.is_file():
+        raise UsageError(f"{raw_out} is not a regular file")
+    if not (spec or "").strip():
+        raise UsageError("spec must not be empty")
 
     contexts = []
-    for src in load_sources(args.context or [], cfg):
+    for src in load_sources(context or [], cfg):
         contexts.append(f"=== CONTEXT FILE: {src.shown} ===\n" + "\n".join(src.lines))
 
     system = load_prompt("write.md")
-    max_output = args.max_output or 4096
-    user = f"Specification:\n{args.spec.strip()}\n\nTarget file: {display_path(out)}"
+    max_output = max_output or 4096
+    user = f"Specification:\n{spec.strip()}\n\nTarget file: {display_path(out_path)}"
     if contexts:
         user += "\n\n" + "\n\n".join(contexts)
     needed = estimate_tokens(system + user) + max_output
@@ -332,43 +380,47 @@ def cmd_write(args: argparse.Namespace, cfg: Config) -> int:
             "pass fewer or smaller --context files"
         )
 
-    progress(f"asking {cfg.model} to write {display_path(out)}")
-    result = chat(cfg, system, user, max_output)
+    llm = get_provider(cfg)
+    progress(f"asking {cfg.model} to write {display_path(out_path)}")
+    result = llm.chat(system, user, max_output)
     if result.truncated:
-        raise OllamaError(
+        raise LLMError(
             f"output reached --max-output ({max_output} tokens) and is incomplete; nothing was written. "
             "Raise --max-output or split the file"
         )
     content = strip_code_fence(result.text)
     if not content.strip():
-        raise OllamaError("the model returned an empty file; nothing was written")
+        raise LLMError("the model returned an empty file; nothing was written")
     if not content.endswith("\n"):
         content += "\n"
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(content, encoding="utf-8")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
     line_count = content.count("\n")
     elapsed = (now_ms() - started) / 1000
-    print(
-        f"local-shunt: wrote {display_path(out)} ({line_count:,} lines) · model {cfg.model} · {elapsed:.1f} s\n"
-        "Review the file and run the tests or linter before relying on it."
-    )
     log_event({
         "session_id": os.environ.get("CLAUDE_SESSION_ID"),
         "event": "write",
-        "files": [display_path(out)],
+        "files": [display_path(out_path)],
         "lines": line_count,
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.output_tokens,
+        "cost_usd": result.cost,
+        "provider": cfg.provider,
         "model": cfg.model,
         "latency_ms": int(elapsed * 1000),
         "outcome": "ok",
     })
-    return 0
+    return (
+        f"local-shunt: wrote {display_path(out_path)} ({line_count:,} lines) · {cfg.provider} {cfg.model} · {elapsed:.1f} s\n"
+        "Review the file and run the tests or linter before relying on it."
+    )
 
 
 # ---------------------------------------------------------------- stats
 
 
-def cmd_stats(args: argparse.Namespace, cfg: Config) -> int:
+def run_stats(since: str | None = None, session: str | None = None) -> str:
     log_file = state_dir() / "log.jsonl"
     records = []
     try:
@@ -379,60 +431,69 @@ def cmd_stats(args: argparse.Namespace, cfg: Config) -> int:
                 except ValueError:
                     continue
     except OSError:
-        print(f"No log yet ({log_file}).")
-        return 0
+        return f"No log yet ({log_file})."
 
-    if args.since:
-        records = [r for r in records if str(r.get("ts", ""))[:10] >= args.since]
-    if args.session:
-        records = [r for r in records if r.get("session_id") == args.session]
+    if since:
+        records = [r for r in records if str(r.get("ts", ""))[:10] >= since]
+    if session:
+        records = [r for r in records if r.get("session_id") == session]
 
-    hook = Counter(r["outcome"] for r in records if r.get("event") == "hook")
+    hook = Counter(r["outcome"] for r in records if r.get("event") == "hook" and "outcome" in r)
     reads = [r for r in records if r.get("event") == "read" and r.get("outcome") == "ok"]
     writes = [r for r in records if r.get("event") == "write" and r.get("outcome") == "ok"]
     errors = Counter(r["outcome"] for r in records if str(r.get("outcome", "")).startswith("error"))
 
-    print(f"Log: {log_file}  ({len(records):,} records)")
-    print("\nHook decisions")
+    lines = [f"Log: {log_file}  ({len(records):,} records)", "", "Hook decisions"]
     if hook:
-        for outcome, count in hook.most_common():
-            print(f"  {outcome:<32} {count:>6,}")
+        lines += [f"  {outcome:<32} {count:>8,}" for outcome, count in hook.most_common()]
     else:
-        print("  (none)")
+        lines.append("  (none)")
 
-    print("\nDelegated reads")
+    lines += ["", "Delegated reads"]
     if reads:
-        est_in = sum(r.get("est_input_tokens", 0) for r in reads)
-        est_out = sum(r.get("est_output_tokens", 0) for r in reads)
-        latency = sum(r.get("latency_ms", 0) for r in reads) / len(reads) / 1000
+        est_in = sum(r.get("est_input_tokens") or 0 for r in reads)
+        est_out = sum(r.get("est_output_tokens") or 0 for r in reads)
+        prompt = sum(r.get("prompt_tokens") or 0 for r in reads)
+        completion = sum(r.get("completion_tokens") or 0 for r in reads)
+        cost = sum(r.get("cost_usd") or 0 for r in records if r.get("outcome") == "ok")
+        latency = sum(r.get("latency_ms") or 0 for r in reads) / len(reads) / 1000
         saved = 1 - est_out / est_in if est_in else 0
-        print(f"  count                            {len(reads):>6,}")
-        print(f"  est. source tokens               {est_in:>6,}")
-        print(f"  est. summary tokens              {est_out:>6,}")
-        print(f"  est. saving                      {saved:>6.1%}")
-        print(f"  average latency                  {latency:>6.1f} s")
+        lines += [
+            f"  {'count':<32} {len(reads):>8,}",
+            f"  {'est. source tokens':<32} {est_in:>8,}",
+            f"  {'est. summary tokens':<32} {est_out:>8,}",
+            f"  {'est. saving':<32} {saved:>8.1%}",
+            f"  {'worker prompt tokens':<32} {prompt:>8,}",
+            f"  {'worker completion tokens':<32} {completion:>8,}",
+            f"  {'average latency':<32} {latency:>7.1f}s",
+            f"  {'reported API cost (read+write)':<32} {cost:>8.4f} USD",
+        ]
+        by_model = Counter(f"{r.get('provider', 'ollama')} {r.get('model')}" for r in reads)
+        lines += [f"  {name:<32} {count:>8,}" for name, count in by_model.most_common()]
     else:
-        print("  (none)")
+        lines.append("  (none)")
 
-    print(f"\nDelegated writes                   {len(writes):>6,}")
+    lines += ["", f"{'Delegated writes':<34} {len(writes):>8,}"]
     if errors:
-        print("\nErrors")
-        for outcome, count in errors.most_common():
-            print(f"  {outcome:<32} {count:>6,}")
-    print("\nToken counts are estimates, not Claude's billed tokens.")
-    return 0
+        lines += ["", "Errors"]
+        lines += [f"  {outcome:<32} {count:>8,}" for outcome, count in errors.most_common()]
+    lines += ["", "Source and summary token counts are estimates, not Claude's billed tokens."]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- main
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="shunt.py", description="Delegate file reading and writing to a local Ollama model.")
+    parser = argparse.ArgumentParser(
+        prog="shunt.py", description="Delegate file reading and writing to a worker model (Ollama or an OpenAI-compatible API)."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     read = sub.add_parser("read", help="answer a question about one or more files")
     read.add_argument("files", nargs="+")
     read.add_argument("--question", "-q", required=True)
+    read.add_argument("--provider", choices=sorted(PROVIDERS))
     read.add_argument("--model")
     read.add_argument("--max-output", type=int)
 
@@ -441,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--spec", required=True)
     write.add_argument("--context", nargs="*")
     write.add_argument("--force", action="store_true")
+    write.add_argument("--provider", choices=sorted(PROVIDERS))
     write.add_argument("--model")
     write.add_argument("--max-output", type=int)
 
@@ -450,31 +512,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    cfg = load_config()
-    if getattr(args, "model", None):
-        cfg.model = args.model
-    handler = {"read": cmd_read, "write": cmd_write, "stats": cmd_stats}[args.command]
+def execute(command: str, cfg: Config, run) -> tuple[int, str]:
+    """Run a command and map errors to (exit code, message). Shared with the MCP server."""
     try:
-        return handler(args, cfg)
+        return 0, run()
     except UsageError as e:
-        print(f"local-shunt: {e}", file=sys.stderr)
-        return EXIT_USAGE
-    except OllamaError as e:
-        print(
-            f"local-shunt: {e}\n"
-            "Fall back to reading the file yourself with Read and offset/limit.",
-            file=sys.stderr,
-        )
+        return EXIT_USAGE, f"local-shunt: {e}"
+    except LLMError as e:
         log_event({
             "session_id": os.environ.get("CLAUDE_SESSION_ID"),
-            "event": args.command,
+            "event": command,
+            "provider": cfg.provider,
             "model": cfg.model,
             "outcome": f"error:{type(e).__name__}",
             "detail": str(e)[:200],
         })
-        return EXIT_FAILURE
+        return EXIT_FAILURE, (
+            f"local-shunt: {e}\n"
+            "Fall back to reading the file yourself with Grep and Read with offset/limit."
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = apply_overrides(load_config(), getattr(args, "provider", None), getattr(args, "model", None))
+    if args.command == "read":
+        run = lambda: run_read(cfg, args.files, args.question, args.max_output)  # noqa: E731
+    elif args.command == "write":
+        run = lambda: run_write(cfg, args.out, args.spec, args.context, args.force, args.max_output)  # noqa: E731
+    else:
+        run = lambda: run_stats(args.since, args.session)  # noqa: E731
+    code, text = execute(args.command, cfg, run)
+    print(text, file=sys.stdout if code == 0 else sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

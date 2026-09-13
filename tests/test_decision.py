@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
-import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
+from helpers import SCRIPTS, FakeLLMServer, IsolatedTestCase
 
-from common import Config, glob_to_regex  # noqa: E402
-from ollama_client import Health, model_available  # noqa: E402
-from shunt_hook import decide, parse_bash_read  # noqa: E402
+import shunt_hook
+from common import Config, glob_to_regex
+from providers import Health, model_available
+from shunt_hook import decide, parse_bash_read
 
 HEALTHY = lambda: Health(ok=True)  # noqa: E731
 UNHEALTHY = lambda: Health(ok=False, reason="down")  # noqa: E731
@@ -25,31 +25,10 @@ def must_not_check_health():
     raise AssertionError("health check should not run for this decision")
 
 
-class DecisionTest(unittest.TestCase):
+class DecisionTest(IsolatedTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
-        self.env = {k: os.environ.get(k) for k in ("CLAUDE_PROJECT_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME")}
-        os.environ["CLAUDE_PROJECT_DIR"] = str(self.dir)
-        os.environ["XDG_STATE_HOME"] = str(self.dir / "state")
-        os.environ["XDG_CONFIG_HOME"] = str(self.dir / "config")
+        super().setUp()
         self.cfg = Config(min_lines=350, min_bytes=32768)
-
-    def tearDown(self):
-        for key, value in self.env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        self.tmp.cleanup()
-
-    def make(self, name: str, lines: int = 0, content: bytes | None = None) -> Path:
-        path = self.dir / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if content is None:
-            content = "".join(f"line {i}\n" for i in range(lines)).encode()
-        path.write_bytes(content)
-        return path
 
     def read(self, path: Path, health=HEALTHY, **tool_input):
         event = {"tool_name": "Read", "tool_input": {"file_path": str(path), **tool_input}, "cwd": str(self.dir)}
@@ -106,9 +85,12 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(d.allow)
         self.assertEqual(d.info.lines, 1)
 
-    def test_ollama_unavailable_fails_open(self):
+    def test_worker_unavailable_fails_open(self):
         d = self.read(self.make("big.py", 1000), health=UNHEALTHY)
-        self.assertEqual((d.allow, d.rule), (True, "ollama-unavailable"))
+        self.assertEqual((d.allow, d.rule), (True, "worker-unavailable"))
+
+    def test_deny_reason_mentions_mcp_tool(self):
+        self.assertIn("shunt_read MCP tool", self.read(self.make("big.py", 1000)).reason)
 
     def test_deny_reason_contains_command_and_bypass(self):
         d = self.read(self.make("src/big.py", 1000))
@@ -208,29 +190,85 @@ class HelpersTest(unittest.TestCase):
         self.assertFalse(model_available("qwen3:4b", ["qwen3:8b"]))
 
 
-class HookProcessTest(unittest.TestCase):
+class HookProcessTest(IsolatedTestCase):
     """Run the hook as Claude Code does: JSON on stdin, JSON on stdout."""
 
-    def run_hook(self, stdin: str, *args: str) -> subprocess.CompletedProcess:
-        env = dict(os.environ, OLLAMA_HOST="http://127.0.0.1:9", XDG_STATE_HOME=tempfile.gettempdir() + "/local-shunt-test")
+    def run_hook(self, stdin: str, mode: str, **env: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "shunt_hook.py"), *args],
-            input=stdin, capture_output=True, text=True, env=env, timeout=10,
+            [sys.executable, str(SCRIPTS / "shunt_hook.py"), mode],
+            input=stdin, capture_output=True, text=True, env=self.isolated_env(**env), timeout=20,
         )
+
+    def read_event(self, path: Path) -> str:
+        return json.dumps({"session_id": "s1", "tool_name": "Read", "tool_input": {"file_path": str(path)}, "cwd": str(self.dir)})
 
     def test_invalid_stdin_fails_open(self):
         result = self.run_hook("not json", "pre-tool-use")
         self.assertEqual((result.returncode, result.stdout), (0, ""))
 
     def test_unreachable_ollama_fails_open(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-            f.write("x = 1\n" * 1000)
-        try:
-            event = {"tool_name": "Read", "tool_input": {"file_path": f.name}, "cwd": "/"}
-            result = self.run_hook(json.dumps(event), "pre-tool-use")
-            self.assertEqual((result.returncode, result.stdout), (0, ""))
-        finally:
-            os.unlink(f.name)
+        result = self.run_hook(self.read_event(self.make("big.py", 1000)), "pre-tool-use", OLLAMA_HOST="http://127.0.0.1:9")
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+        self.assertEqual(self.log_records()[-1]["outcome"], "allowed:worker-unavailable")
+
+    def test_denies_with_fake_ollama_and_logs(self):
+        with FakeLLMServer() as server:
+            result = self.run_hook(
+                self.read_event(self.make("big.py", 1000)), "pre-tool-use",
+                OLLAMA_HOST=server.url, LOCAL_SHUNT_MODEL="fake",
+            )
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("shunt.py", output["permissionDecisionReason"])
+        record = self.log_records()[-1]
+        self.assertEqual((record["outcome"], record["session_id"], record["lines"]), ("denied", "s1", 1000))
+
+    def test_remote_provider_does_not_wait_on_network(self):
+        # 10.255.255.1 is unroutable: a network probe would hang until the timeout.
+        started = time.monotonic()
+        result = self.run_hook(
+            self.read_event(self.make("big.py", 1000)), "pre-tool-use",
+            LOCAL_SHUNT_PROVIDER="openrouter", LOCAL_SHUNT_API_BASE="http://10.255.255.1/v1",
+            OPENROUTER_API_KEY="test-key", LOCAL_SHUNT_MODEL="some/model",
+        )
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_remote_provider_without_key_fails_open(self):
+        result = self.run_hook(self.read_event(self.make("big.py", 1000)), "pre-tool-use", LOCAL_SHUNT_PROVIDER="openrouter")
+        self.assertEqual(result.stdout, "")
+
+    def test_session_start_active(self):
+        with FakeLLMServer() as server:
+            result = self.run_hook(
+                json.dumps({"cwd": str(self.dir)}), "session-start",
+                LOCAL_SHUNT_PROVIDER="openai-compatible", LOCAL_SHUNT_API_BASE=server.url + "/v1",
+                LOCAL_SHUNT_MODEL="fake-model",
+            )
+        text = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("local-shunt is active (provider openai-compatible, model fake-model", text)
+        self.assertNotIn("sent to that service", text)
+
+    def test_session_start_inactive_reports_reason(self):
+        result = self.run_hook(json.dumps({"cwd": str(self.dir)}), "session-start", LOCAL_SHUNT_PROVIDER="openrouter")
+        text = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("inactive", text)
+        self.assertIn("OPENROUTER_API_KEY", text)
+
+    def test_session_start_disabled_is_silent(self):
+        result = self.run_hook(json.dumps({"cwd": str(self.dir)}), "session-start", LOCAL_SHUNT_DISABLE="1")
+        self.assertEqual(result.stdout, "")
+
+
+class SessionStartRemoteTest(IsolatedTestCase):
+    def test_remote_endpoint_warns_about_data_leaving_machine(self):
+        with mock.patch.dict("os.environ", {"LOCAL_SHUNT_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "k"}):
+            with mock.patch.object(shunt_hook, "check_health", return_value=Health(ok=True)) as check:
+                output = shunt_hook.handle_session_start({"cwd": str(self.dir)})
+        self.assertTrue(check.call_args.kwargs["probe_remote"])
+        text = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("https://openrouter.ai/api/v1", text)
+        self.assertIn("sent to that service", text)
 
 
 if __name__ == "__main__":

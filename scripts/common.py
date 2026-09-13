@@ -31,9 +31,29 @@ NATIVE_EXTENSIONS = {
 LINE_COUNT_BYTE_CAP = 64 * 1024 * 1024
 
 
+LOG_ROTATE_BYTES = 10 * 1024 * 1024
+
+# Provider presets: default API base and the environment variable holding the key.
+PROVIDERS = {
+    "ollama": {"api_base": None, "api_key_env": ""},
+    "openai-compatible": {"api_base": None, "api_key_env": ""},
+    "openrouter": {"api_base": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+    "openai": {"api_base": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
+}
+
+
 @dataclass
 class Config:
     enabled: bool = True
+    provider: str = "ollama"
+    api_base: str = ""  # OpenAI-compatible base URL, e.g. https://openrouter.ai/api/v1
+    api_key_env: str = ""  # name of the environment variable holding the API key
+    # Dotenv files searched for api_key_env; relative paths resolve against the project.
+    env_files: list[str] = field(default_factory=lambda: ["~/.config/local-shunt/.env"])
+    api_keys: dict[str, str] = field(default_factory=dict, repr=False)  # provider -> key
+    max_retries: int = 3
+    disable_reasoning: bool = True  # ask thinking models to skip reasoning (saves output budget)
+    extra_body: dict = field(default_factory=dict)  # merged into OpenAI-compatible request bodies
     ollama_host: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:7b"
     min_lines: int = 350
@@ -49,7 +69,15 @@ class Config:
     exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
 
 
+# Settings that decide where file contents and API keys are sent. A project config
+# may come from an untrusted repository, so these are read only from the user
+# config file and the environment.
+TRUSTED_KEYS = {"provider", "api_base", "api_key_env", "env_files", "api_keys", "ollama_host", "extra_body"}
+
 ENV_MAP = {
+    "provider": "LOCAL_SHUNT_PROVIDER",
+    "api_base": "LOCAL_SHUNT_API_BASE",
+    "api_key_env": "LOCAL_SHUNT_API_KEY_ENV",
     "ollama_host": "OLLAMA_HOST",
     "model": "LOCAL_SHUNT_MODEL",
     "min_lines": "LOCAL_SHUNT_MIN_LINES",
@@ -80,6 +108,10 @@ def _coerce(name: str, value, default):
         return int(value)
     if isinstance(default, float):
         return float(value)
+    if isinstance(default, dict):
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be an object")
+        return {str(k): (str(v) if name == "api_keys" else v) for k, v in value.items()}
     if isinstance(default, list):
         if not isinstance(value, list):
             raise ValueError(f"{name} must be a list")
@@ -103,10 +135,11 @@ def load_config(cwd: str | None = None) -> Config:
     defaults = {f.name: getattr(cfg, f.name) for f in fields(Config)}
 
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    layers = [
-        _read_json(config_home / "local-shunt" / "config.json"),
-        _read_json(project_dir(cwd) / ".claude" / "local-shunt.json"),
-    ]
+    user_layer = _read_json(config_home / "local-shunt" / "config.json")
+    project_layer = _read_json(project_dir(cwd) / ".claude" / "local-shunt.json")
+    for key in TRUSTED_KEYS:
+        project_layer.pop(key, None)
+    layers = [user_layer, project_layer]
     env_layer = {key: os.environ[var] for key, var in ENV_MAP.items() if os.environ.get(var)}
     if os.environ.get("LOCAL_SHUNT_DISABLE") == "1":
         env_layer["enabled"] = False
@@ -122,7 +155,81 @@ def load_config(cwd: str | None = None) -> Config:
                 pass  # Ignore malformed values; keep the previous layer.
 
     cfg.ollama_host = _normalize_host(cfg.ollama_host)
+    cfg.provider = cfg.provider.strip().lower()
+    preset = PROVIDERS.get(cfg.provider)
+    if preset is not None:
+        if not cfg.api_base and preset["api_base"]:
+            cfg.api_base = preset["api_base"]
+        if not cfg.api_key_env:
+            cfg.api_key_env = preset["api_key_env"]
+    cfg.api_base = cfg.api_base.strip().rstrip("/")
     return cfg
+
+
+def parse_dotenv(text: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines. Supports `export`, quotes and trailing comments."""
+    values = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        values[key] = value
+    return values
+
+
+def resolve_api_key(cfg: Config, cwd: str | None = None) -> str | None:
+    """Find the API key: environment variable, then env_files, then api_keys in the user config."""
+    if cfg.api_key_env:
+        if os.environ.get(cfg.api_key_env):
+            return os.environ[cfg.api_key_env]
+        for name in cfg.env_files:
+            path = Path(os.path.expanduser(name))
+            if not path.is_absolute():
+                path = project_dir(cwd) / path
+            try:
+                value = parse_dotenv(path.read_text(encoding="utf-8")).get(cfg.api_key_env)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if value:
+                return value
+    return cfg.api_keys.get(cfg.provider) or None
+
+
+def config_problem(cfg: Config, cwd: str | None = None) -> str | None:
+    """Return a description of a configuration error, or None."""
+    if cfg.provider not in PROVIDERS:
+        return f"unknown provider {cfg.provider!r} (expected one of: {', '.join(PROVIDERS)})"
+    if cfg.provider != "ollama" and not cfg.api_base:
+        return f"provider {cfg.provider} needs api_base"
+    if cfg.api_key_env and not resolve_api_key(cfg, cwd):
+        return (
+            f"API key not found: set {cfg.api_key_env}, add it to one of {cfg.env_files}, "
+            f"or set api_keys.{cfg.provider} in ~/.config/local-shunt/config.json"
+        )
+    return None
+
+
+def endpoint(cfg: Config) -> str:
+    return cfg.ollama_host if cfg.provider == "ollama" else cfg.api_base
+
+
+def is_local_endpoint(url: str) -> bool:
+    hostname = url.split("//", 1)[-1].split("/", 1)[0]
+    if hostname.startswith("["):
+        hostname = hostname[1:].split("]", 1)[0]
+    else:
+        hostname = hostname.rsplit(":", 1)[0]
+    return hostname in ("localhost", "127.0.0.1", "::1")
 
 
 def glob_to_regex(pattern: str) -> re.Pattern:
@@ -210,7 +317,10 @@ def log_event(record: dict) -> None:
         directory = state_dir()
         directory.mkdir(parents=True, exist_ok=True)
         record = {"ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"), **record}
-        with (directory / "log.jsonl").open("a", encoding="utf-8") as f:
+        log_file = directory / "log.jsonl"
+        if log_file.exists() and log_file.stat().st_size > LOG_ROTATE_BYTES:
+            log_file.replace(directory / "log.jsonl.1")
+        with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
@@ -218,3 +328,17 @@ def log_event(record: dict) -> None:
 
 def now_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+def apply_overrides(cfg: Config, provider: str | None = None, model: str | None = None) -> Config:
+    """Apply command-line overrides. A new provider resets its preset endpoint and key variable."""
+    if provider:
+        cfg.provider = provider.strip().lower()
+        preset = PROVIDERS.get(cfg.provider, {})
+        if preset.get("api_base"):
+            cfg.api_base = preset["api_base"]
+        if preset.get("api_key_env") is not None and cfg.provider in ("openrouter", "openai"):
+            cfg.api_key_env = preset["api_key_env"]
+    if model:
+        cfg.model = model
+    return cfg

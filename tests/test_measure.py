@@ -334,7 +334,7 @@ class BenchTest(IsolatedTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Task good", result.stdout)
-        self.assertIn(f"Results: {out}", result.stdout)
+        self.assertIn(f"Results: {out.resolve()}", result.stdout)  # macOS: /var is a symlink
         self.assertIn("[1/2] good", result.stderr)
         self.assertIn("Task good", run_bench_report([str(out)]))
         with self.assertRaisesRegex(UsageError, "missing.jsonl"):

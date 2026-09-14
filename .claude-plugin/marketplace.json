@@ -1,0 +1,19 @@
+{
+  "name": "local-shunt",
+  "owner": {
+    "name": "cofemei",
+    "url": "https://github.com/cofemei"
+  },
+  "description": "Claude Code plugins by cofemei",
+  "plugins": [
+    {
+      "name": "local-shunt",
+      "source": "./",
+      "description": "Delegate large file reads to a worker model (local Ollama or an OpenAI-compatible API such as OpenRouter) to save Claude tokens",
+      "homepage": "https://github.com/cofemei/local-shunt",
+      "repository": "https://github.com/cofemei/local-shunt",
+      "license": "GPL-3.0-or-later",
+      "category": "productivity"
+    }
+  ]
+}

@@ -112,18 +112,21 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
    curl http://localhost:11434/api/tags
    ```
 
-3. 開發期間，直接載入 plugin 目錄：
-
-   ```bash
-   claude --plugin-dir /path/to/local-shunt
-   ```
-
-   正式使用時，透過 marketplace 安裝：
+3. 在 Claude Code 中加入 marketplace 並安裝 plugin：
 
    ```text
-   /plugin marketplace add /path/to/marketplace
-   /plugin install local-shunt@<marketplace-name>
+   /plugin marketplace add cofemei/local-shunt
+   /plugin install local-shunt@local-shunt
    ```
+
+   也可以在終端機執行：
+
+   ```bash
+   claude plugin marketplace add cofemei/local-shunt
+   claude plugin install local-shunt@local-shunt
+   ```
+
+   `cofemei/local-shunt` 是 GitHub repository，`local-shunt@local-shunt` 是「plugin 名稱@marketplace 名稱」。安裝完成後開啟新的工作階段。
 
 4. 在 Claude Code 設定中允許 worker，避免每次呼叫都跳出權限確認：
 
@@ -132,8 +135,7 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
      "permissions": {
        "allow": [
          "mcp__plugin_local-shunt_local-shunt__shunt_read",
-         "mcp__plugin_local-shunt_local-shunt__shunt_stats",
-         "Bash(python3 /path/to/local-shunt/scripts/shunt.py read:*)"
+         "mcp__plugin_local-shunt_local-shunt__shunt_stats"
        ]
      }
    }
@@ -141,7 +143,47 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
 
    `shunt_write` 會寫入檔案，建議保留權限確認。
 
+   Claude 也可能透過 `Bash` 執行 `shunt.py read`。從 marketplace 安裝時，腳本位於 `~/.claude/plugins/cache/local-shunt/local-shunt/<版本>/scripts/shunt.py`，路徑隨版本改變，因此建議只允許 MCP 工具。
+
 安裝完成後，讀取一個超過 350 行的檔案。Claude 應改用 `shunt_read`，或在被 hook 拒絕後改用。
+
+### 更新與移除
+
+```bash
+claude plugin marketplace update local-shunt   # 取得最新的 marketplace 內容
+claude plugin update local-shunt@local-shunt   # 更新 plugin
+claude plugin uninstall local-shunt@local-shunt
+```
+
+Claude Code 預設會在背景自動更新 plugin，並依 `.claude-plugin/plugin.json` 的 `version` 判斷是否有新版。維護者推送新的 commit 時，必須同時提高 `version`（以及 `scripts/mcp_server.py` 的 `SERVER_INFO`），使用者才會收到更新。發布時可以用 `claude plugin tag` 建立 `local-shunt--v<版本>` 格式的 git tag。
+
+### 團隊共用
+
+在專案的 `.claude/settings.json` 加入以下設定。團隊成員信任該專案資料夾後，Claude Code 會自動加入 marketplace 並提示安裝：
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "local-shunt": {
+      "source": { "source": "github", "repo": "cofemei/local-shunt" }
+    }
+  },
+  "enabledPlugins": {
+    "local-shunt@local-shunt": true
+  }
+}
+```
+
+每位成員仍需自行準備 worker（Ollama 或 API 金鑰），見步驟 1、2 與[使用外部 API](#使用外部-api)。
+
+### 從原始碼載入（開發用）
+
+```bash
+git clone https://github.com/cofemei/local-shunt.git
+claude --plugin-dir ./local-shunt
+```
+
+以 `--plugin-dir` 載入時，`shunt.py` 位於 clone 的 `scripts/` 目錄，可以在步驟 4 的權限中加入 `"Bash(python3 /path/to/local-shunt/scripts/shunt.py read:*)"`。
 
 ## 使用外部 API
 
@@ -196,7 +238,8 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
 ```text
 local-shunt/
 ├── .claude-plugin/
-│   └── plugin.json            # plugin 中繼資料
+│   ├── plugin.json            # plugin 中繼資料
+│   └── marketplace.json       # marketplace 定義，供使用者從 GitHub 安裝
 ├── .mcp.json                  # 註冊 MCP server
 ├── .github/workflows/
 │   ├── test.yml               # GitHub Actions：自動測試
@@ -829,7 +872,7 @@ python3 -m unittest discover -s tests
 
 測試不需要 Ollama、網路或 API 金鑰。`tests/helpers.py` 為每項測試建立獨立的專案、設定與紀錄目錄，清除相關環境變數，並提供模擬 Ollama 與 OpenAI 相容 API 的本機 HTTP 伺服器。
 
-GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每個 pull request 時執行上述測試，涵蓋 Ubuntu 上的 Python 3.10 至 3.14，以及 macOS 上的 Python 3.10 與 3.14。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
+GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每個 pull request 時，以 `claude plugin validate --strict` 驗證 plugin 與 marketplace 的定義，並執行上述測試，涵蓋 Ubuntu 上的 Python 3.10 至 3.14，以及 macOS 上的 Python 3.10 與 3.14。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
 
 | 檔案 | 測試數 | 涵蓋範圍 |
 |---|---|---|

@@ -41,6 +41,10 @@ class ModelOutputError(LLMError):
     """The request succeeded but the output is unusable; retrying will not help."""
 
 
+class RequestTimeout(LLMError):
+    """The server did not answer in time. A slow model stays slow, so this is not retried."""
+
+
 class HTTPStatusError(LLMError):
     def __init__(self, status: int, message: str, retry_after: float | None = None):
         super().__init__(f"HTTP {status}: {message}")
@@ -79,6 +83,8 @@ def http_json(url: str, payload: dict | None, timeout: float, headers: dict | No
             retry_after = None
         raise HTTPStatusError(e.code, _error_message(e.read().decode("utf-8", "replace")), retry_after) from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
+        if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+            raise RequestTimeout(f"{url.split('?', 1)[0]} did not respond within {timeout:g} s") from e
         # Strip the query string; it never carries secrets here, but keep messages short.
         raise LLMError(f"cannot reach {url.split('?', 1)[0]}: {getattr(e, 'reason', e)}") from e
     except ValueError as e:
@@ -122,7 +128,7 @@ class Provider:
                     raise
                 delay = e.retry_after * BACKOFF_SCALE if e.retry_after is not None and e.retry_after <= 60 else backoff(attempt)
             except LLMError as e:
-                if isinstance(e, ModelOutputError) or attempt == attempts - 1:
+                if isinstance(e, (ModelOutputError, RequestTimeout)) or attempt == attempts - 1:
                     raise
                 delay = backoff(attempt)
             time.sleep(delay)

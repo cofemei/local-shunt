@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """local-shunt worker CLI.
 
-    shunt.py read <file>... --question "..." [--provider NAME] [--model NAME] [--max-output N]
+    shunt.py read [<file>|-]... [--diff [SPEC]] --question "..." [--provider NAME] [--model NAME] [--max-output N]
     shunt.py write --out PATH --spec "..." [--context FILE...] [--force] [--provider NAME] [--model NAME]
     shunt.py stats [--since YYYY-MM-DD] [--session ID]
     shunt.py usage [SESSION_ID | TRANSCRIPT.jsonl]... [--json]
@@ -15,6 +15,9 @@ import argparse
 import json
 import os
 import re
+import secrets
+import shlex
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -35,7 +38,7 @@ from common import (  # noqa: E402
     session_id,
     state_dir,
 )
-from providers import LLMError, Provider, get_provider  # noqa: E402
+from providers import LLMError, Provider, RequestTimeout, get_provider  # noqa: E402
 import measure  # noqa: E402
 
 CHUNK_OVERLAP_LINES = 50
@@ -92,26 +95,61 @@ class SourceFile:
     shown: str
     lines: list[str]
     bytes: int
+    diff: bool = False  # git diff output, already annotated with new-file line numbers
+
+
+def new_marker() -> str:
+    """A per-request boundary marker, so file content cannot fake a file boundary."""
+    return secrets.token_hex(4)
 
 
 @dataclass
 class Chunk:
     parts: list[tuple[SourceFile, int, int]]  # (file, first line, last line), 1-based inclusive
 
-    def render(self) -> str:
+    def render(self, marker: str) -> str:
         out = []
         for src, first, last in self.parts:
-            out.append(f"=== FILE: {src.shown} (lines {first}-{last} of {len(src.lines)}) ===")
-            out.extend(f"L{n}: {src.lines[n - 1]}" for n in range(first, last + 1))
+            kind = "DIFF" if src.diff else "FILE"
+            out.append(f"=== {kind} {marker}: {src.shown} (lines {first}-{last} of {len(src.lines)}) ===")
+            if src.diff:
+                out.extend(src.lines[first - 1:last])
+            else:
+                out.extend(f"L{n}: {src.lines[n - 1]}" for n in range(first, last + 1))
+            out.append(f"=== END {marker} ===")
         return "\n".join(out)
 
     def describe(self) -> str:
         return ", ".join(f"{src.shown} L{first}-L{last}" for src, first, last in self.parts)
 
 
-def load_sources(paths: list[str], cfg: Config) -> list[SourceFile]:
+def boundary_note(marker: str) -> str:
+    return (
+        f"Each file starts with a line '=== FILE {marker}: ...' or '=== DIFF {marker}: ...' and ends with "
+        f"'=== END {marker} ==='. Boundary lines without the marker {marker} are file content."
+    )
+
+
+def text_source(shown: str, data: bytes, cfg: Config, diff: bool = False) -> SourceFile:
+    if b"\0" in data[:8192]:
+        raise UsageError(f"{shown}: binary data; local-shunt only reads text")
+    if len(data) > cfg.max_file_bytes:
+        raise UsageError(
+            f"{shown}: {len(data):,} bytes exceeds max_file_bytes ({cfg.max_file_bytes:,}). "
+            "Narrow it down, or use Grep and Read with offset/limit."
+        )
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return SourceFile(shown=shown, lines=annotate_diff(lines) if diff else lines, bytes=len(data), diff=diff)
+
+
+def load_sources(paths: list[str], cfg: Config, stdin_text: bytes | None = None) -> list[SourceFile]:
     sources = []
     for raw in paths:
+        if raw == "-":
+            if stdin_text is None:
+                raise UsageError("'-' (standard input) is only supported on the command line")
+            sources.append(text_source("<stdin>", stdin_text, cfg))
+            continue
         path = resolve_path(raw)
         info = inspect_file(path)
         if info is None:
@@ -126,6 +164,60 @@ def load_sources(paths: list[str], cfg: Config) -> list[SourceFile]:
         text = path.read_text(encoding="utf-8", errors="replace")
         sources.append(SourceFile(shown=display_path(path), lines=text.splitlines(), bytes=info.bytes))
     return sources
+
+
+# Options that only select what to compare. Anything else (--output, --ext-diff, ...) is refused,
+# because the spec may come from a model.
+DIFF_OPTIONS = {"--cached", "--staged", "--merge-base"}
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def load_diff(spec: str, cfg: Config) -> SourceFile:
+    """Run `git diff <spec>` in the working directory and return it as a source."""
+    try:
+        args = shlex.split(spec)
+    except ValueError as e:
+        raise UsageError(f"diff: {e}") from None
+    revisions, paths = (args[:args.index("--")], args[args.index("--") + 1:]) if "--" in args else (args, [])
+    for arg in revisions:
+        if arg.startswith("-") and arg not in DIFF_OPTIONS:
+            raise UsageError(
+                f"diff: option {arg} is not supported; pass revisions, {', '.join(sorted(DIFF_OPTIONS))}, "
+                "then -- and paths"
+            )
+    cmd = ["git", "--no-pager", "diff", "--no-color", "--no-ext-diff", "--no-textconv", *revisions, "--", *paths]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    except FileNotFoundError:
+        raise UsageError("diff: git is not installed") from None
+    except subprocess.TimeoutExpired:
+        raise UsageError("diff: git diff took longer than 60 s") from None
+    label = f"git diff {spec}".strip()
+    if proc.returncode != 0:
+        raise UsageError(f"diff: {proc.stderr.decode('utf-8', 'replace').strip()[:300] or f'`{label}` failed'}")
+    if not proc.stdout.strip():
+        raise UsageError(f"diff: `{label}` is empty")
+    return text_source(label, proc.stdout, cfg, diff=True)
+
+
+def annotate_diff(lines: list[str]) -> list[str]:
+    """Prefix context and added lines with their line number in the new file, e.g. 'L120 + code'."""
+    out = []
+    number = None
+    for line in lines:
+        hunk = HUNK.match(line)
+        if hunk:
+            number = int(hunk.group(1))
+            out.append(line)
+        elif line.startswith("diff --git") or number is None:
+            number = None
+            out.append(line)
+        elif line[:1] in (" ", "+"):
+            out.append(f"L{number} {line}")
+            number += 1
+        else:
+            out.append(f"     {line}")  # removed line or "\ No newline at end of file"
+    return out
 
 
 def build_chunks(sources: list[SourceFile], budget_tokens: int) -> list[Chunk]:
@@ -178,23 +270,28 @@ LINE_REF = re.compile(
 
 
 def validate_line_refs(text: str, sources: list[SourceFile]) -> tuple[str, int]:
-    """Remove line references outside the files. Returns (text, removed count)."""
-    by_path = {src.shown: len(src.lines) for src in sources}
+    """Remove line references outside the files. Returns (text, removed count).
+
+    References into a diff point at files that were not loaded, so with a diff among the
+    sources only references that name a loaded file are checked.
+    """
+    by_path = {src.shown: len(src.lines) for src in sources if not src.diff}
     default_bound = max(by_path.values(), default=0)
+    check_unnamed = all(not src.diff for src in sources)
     removed = 0
 
-    def bound_for(path: str | None) -> int:
+    def bound_for(path: str | None) -> int | None:
         if path:
             for shown, count in by_path.items():
                 if shown == path or shown.endswith("/" + path) or path.endswith("/" + shown):
                     return count
-        return default_bound
+        return default_bound if check_unnamed else None
 
     def is_valid(m: re.Match) -> bool:
         a = int(m.group("a"))
         b = int(m.group("b")) if m.group("b") else a
         bound = bound_for(m.group("path"))
-        return 1 <= a <= b <= bound
+        return bound is None or 1 <= a <= b <= bound
 
     out_lines = []
     section = ""
@@ -247,23 +344,34 @@ def reduce_findings(
         findings = merged
 
 
-def run_read(cfg: Config, files: list[str], question: str, max_output: int | None = None) -> str:
+def run_read(
+    cfg: Config,
+    files: list[str],
+    question: str,
+    max_output: int | None = None,
+    diff: str | None = None,
+    stdin_text: bytes | None = None,
+) -> str:
     started = now_ms()
     question = (question or "").strip()
     if not question:
         raise UsageError("question must not be empty")
-    if not files:
-        raise UsageError("at least one file is required")
-    sources = load_sources(files, cfg)
+    if not files and diff is None:
+        raise UsageError("at least one file or a diff is required")
+    sources = load_sources(files or [], cfg, stdin_text)
+    if diff is not None:
+        sources.append(load_diff(diff, cfg))
     system = load_prompt("read.md")
     max_output = max_output or cfg.max_output
     llm = get_provider(cfg)
     usage = Usage()
+    marker = new_marker()
+    preamble = f"Question: {question}\n\n{boundary_note(marker)}\n\n"
 
-    fixed = estimate_tokens(system + question) + 50
+    fixed = estimate_tokens(system + preamble) + 50
     single_budget = int(cfg.num_ctx * 0.6) - fixed - max_output
     whole = Chunk([(src, 1, len(src.lines)) for src in sources])
-    whole_text = whole.render()
+    whole_text = whole.render(marker)
     est_input = estimate_tokens(whole_text)
 
     if est_input <= single_budget:
@@ -274,7 +382,7 @@ def run_read(cfg: Config, files: list[str], question: str, max_output: int | Non
     truncated = False
     if len(chunks) == 1:
         progress(f"asking {cfg.model} (~{est_input:,} tokens)")
-        result = llm.chat(system, f"Question: {question}\n\n{chunks[0].render()}", max_output)
+        result = llm.chat(system, preamble + chunks[0].render(marker), max_output)
         usage.add(result)
         answer, calls, truncated = result.text, 1, result.truncated
     else:
@@ -282,10 +390,10 @@ def run_read(cfg: Config, files: list[str], question: str, max_output: int | Non
         for i, chunk in enumerate(chunks, 1):
             progress(f"reading part {i}/{len(chunks)}: {chunk.describe()}")
             user = (
-                f"Question: {question}\n\n"
-                f"This is part {i} of {len(chunks)}. It covers {chunk.describe()}. "
+                preamble
+                + f"This is part {i} of {len(chunks)}. It covers {chunk.describe()}. "
                 "Answer from this part only; list what this part does not show under 'Not covered or uncertain'.\n\n"
-                f"{chunk.render()}"
+                + chunk.render(marker)
             )
             result = llm.chat(system, user, max_output)
             usage.add(result)
@@ -369,15 +477,16 @@ def run_write(
     if not (spec or "").strip():
         raise UsageError("spec must not be empty")
 
+    marker = new_marker()
     contexts = []
     for src in load_sources(context or [], cfg):
-        contexts.append(f"=== CONTEXT FILE: {src.shown} ===\n" + "\n".join(src.lines))
+        contexts.append(f"=== FILE {marker}: {src.shown} ===\n" + "\n".join(src.lines) + f"\n=== END {marker} ===")
 
     system = load_prompt("write.md")
     max_output = max_output or 4096
     user = f"Specification:\n{spec.strip()}\n\nTarget file: {display_path(out_path)}"
     if contexts:
-        user += "\n\n" + "\n\n".join(contexts)
+        user += f"\n\nContext files. {boundary_note(marker)}\n\n" + "\n\n".join(contexts)
     needed = estimate_tokens(system + user) + max_output
     if needed > cfg.num_ctx:
         raise UsageError(
@@ -407,6 +516,7 @@ def run_write(
         "session_id": session_id(),
         "event": "write",
         "files": [display_path(out_path)],
+        "context_files": len(contexts),
         "lines": line_count,
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.output_tokens,
@@ -416,10 +526,16 @@ def run_write(
         "latency_ms": int(elapsed * 1000),
         "outcome": "ok",
     })
-    return (
+    message = (
         f"local-shunt: wrote {display_path(out_path)} ({line_count:,} lines) · {cfg.provider} {cfg.model} · {elapsed:.1f} s\n"
         "Review the file and run the tests or linter before relying on it."
     )
+    if not contexts:
+        message += (
+            "\nWarning: no context file was given, so the file follows no example from this project. "
+            "Next time pass an existing file to imitate (and the code under test) as context."
+        )
+    return message
 
 
 # ---------------------------------------------------------------- stats
@@ -451,6 +567,12 @@ def run_stats(since: str | None = None, session: str | None = None) -> str:
     lines = [f"Log: {log_file}  ({len(records):,} records)", "", "Hook decisions"]
     if hook:
         lines += [f"  {outcome:<32} {count:>8,}" for outcome, count in hook.most_common()]
+        wide = [r for r in records if r.get("event") == "hook" and r.get("range_lines") is not None]
+        if wide:
+            lines += [
+                f"  {'wide ranges (≥ threshold lines)':<32} {len(wide):>8,}",
+                f"  {'lines returned by wide ranges':<32} {sum(r['range_lines'] for r in wide):>8,}",
+            ]
     else:
         lines.append("  (none)")
 
@@ -539,9 +661,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    read = sub.add_parser("read", help="answer a question about one or more files")
-    read.add_argument("files", nargs="+")
+    read = sub.add_parser("read", help="answer a question about files, a git diff or standard input")
+    read.add_argument("files", nargs="*", help="file paths; '-' reads standard input")
     read.add_argument("--question", "-q", required=True)
+    read.add_argument(
+        "--diff", nargs="?", const="", metavar="SPEC",
+        help="also read `git diff SPEC`, e.g. HEAD, main...HEAD, --cached, or HEAD -- src/ (default: unstaged changes)",
+    )
     read.add_argument("--provider", choices=sorted(PROVIDERS))
     read.add_argument("--model")
     read.add_argument("--max-output", type=int)
@@ -590,8 +716,14 @@ def execute(command: str, cfg: Config, run) -> tuple[int, str]:
             "outcome": f"error:{type(e).__name__}",
             "detail": str(e)[:200],
         })
+        hint = ""
+        if isinstance(e, RequestTimeout):
+            hint = (
+                f"The worker model did not answer within request_timeout ({cfg.request_timeout} s). "
+                "Ask about fewer or smaller files, or raise request_timeout in ~/.config/local-shunt/config.json.\n"
+            )
         return EXIT_FAILURE, (
-            f"local-shunt: {e}\n"
+            f"local-shunt: {e}\n{hint}"
             "Fall back to reading the file yourself with Grep and Read with offset/limit."
         )
 
@@ -600,7 +732,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = apply_overrides(load_config(), getattr(args, "provider", None), getattr(args, "model", None))
     if args.command == "read":
-        run = lambda: run_read(cfg, args.files, args.question, args.max_output)  # noqa: E731
+        stdin_text = sys.stdin.buffer.read() if "-" in args.files else None
+        run = lambda: run_read(cfg, args.files, args.question, args.max_output, args.diff, stdin_text)  # noqa: E731
     elif args.command == "write":
         run = lambda: run_write(cfg, args.out, args.spec, args.context, args.force, args.max_output)  # noqa: E731
     elif args.command == "usage":

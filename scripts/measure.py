@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import time
@@ -30,7 +31,10 @@ DEFAULT_ALLOWED_TOOLS = ["Read", "Grep", "Glob", f"Bash(python3 {SHUNT_SCRIPT} r
 DEFAULT_TIMEOUT = 900
 
 SHUNT_BASH = re.compile(r"shunt\.py['\"]?\s+read\b")
+SHUNT_BASH_WRITE = re.compile(r"shunt\.py['\"]?\s+write\b")
 DENIAL = re.compile(r"local-shunt: .+ is large \(")
+VERIFY_TIMEOUT = 300
+VERIFY_OUTPUT_CHARS = 1000
 
 # Prompt-caching price multipliers relative to uncached input tokens.
 CACHE_WRITE_5M = 1.25
@@ -39,6 +43,11 @@ CACHE_READ = 0.1
 
 READ_CATEGORIES = ("Read", "Read (range)", "shunt_read (MCP)", "shunt read (Bash)")
 DELEGATION_CATEGORIES = ("shunt_read (MCP)", "shunt read (Bash)")
+# Names usable in a task's expect_tools and forbid_tools besides the tool categories themselves.
+TOOL_GROUPS = {
+    "delegate-read": DELEGATION_CATEGORIES,
+    "delegate-write": ("shunt_write (MCP)", "shunt write (Bash)"),
+}
 TARGET_SAVING = 0.70
 
 
@@ -129,6 +138,8 @@ def _categorize(name: str, tool_input: dict) -> str:
         return "Read (range)" if ranged else "Read"
     if name == "Bash" and SHUNT_BASH.search(str(tool_input.get("command", ""))):
         return "shunt read (Bash)"
+    if name == "Bash" and SHUNT_BASH_WRITE.search(str(tool_input.get("command", ""))):
+        return "shunt write (Bash)"
     if name.endswith("__shunt_read"):
         return "shunt_read (MCP)"
     if name.endswith("__shunt_write"):
@@ -310,6 +321,31 @@ class Task:
     model: str | None = None
     allowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_TOOLS))
     timeout: int = DEFAULT_TIMEOUT
+    expect_tools: list[str] = field(default_factory=list)  # checked in 'on' runs only
+    forbid_tools: list[str] = field(default_factory=list)  # checked in 'on' runs only
+    isolate: bool = False  # run in a fresh copy of cwd, so edits do not touch the original
+    verify: list[str] = field(default_factory=list)  # command run in the working directory after the run
+
+    @property
+    def checks_answer(self) -> bool:
+        return bool(self.expect or self.verify)
+
+
+def _string_list(value, name: str, where: str) -> list[str]:
+    value = [] if value is None else [value] if isinstance(value, str) else value
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise MeasureError(f"{where}: {name} must be a string or a list of strings")
+    return value
+
+
+def tool_check_failures(task: Task, tool_calls: dict[str, int]) -> list[str]:
+    """Return the expect_tools and forbid_tools rules a run broke."""
+    def used(name: str) -> bool:
+        return any(tool_calls.get(c, 0) for c in TOOL_GROUPS.get(name, (name,)))
+
+    failures = [f"did not use {name}" for name in task.expect_tools if not used(name)]
+    failures += [f"used {name}" for name in task.forbid_tools if used(name)]
+    return failures
 
 
 def load_tasks(path: Path) -> list[Task]:
@@ -343,11 +379,16 @@ def load_tasks(path: Path) -> list[Task]:
         cwd = (cwd if cwd.is_absolute() else path.parent / cwd).resolve()
         if not cwd.is_dir():
             raise MeasureError(f"{path}: task {task_id}: cwd {cwd} is not a directory")
-        expect = spec.get("expect") or []
-        expect = [expect] if isinstance(expect, str) else expect
-        tools = spec.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
-        if not all(isinstance(p, str) for p in expect) or not all(isinstance(t, str) for t in tools):
-            raise MeasureError(f"{path}: task {task_id}: expect and allowed_tools must be strings")
+        where = f"{path}: task {task_id}"
+        expect = _string_list(spec.get("expect"), "expect", where)
+        tools = _string_list(spec.get("allowed_tools"), "allowed_tools", where) or DEFAULT_ALLOWED_TOOLS
+        expect_tools = _string_list(spec.get("expect_tools"), "expect_tools", where)
+        forbid_tools = _string_list(spec.get("forbid_tools"), "forbid_tools", where)
+        verify = _string_list(spec.get("verify"), "verify", where)
+        verify = [arg.replace("{tasks_dir}", str(path.parent.resolve())) for arg in verify]
+        isolate = spec.get("isolate", False)
+        if not isinstance(isolate, bool):
+            raise MeasureError(f"{where}: isolate must be true or false")
         for pattern in expect:
             try:
                 re.compile(pattern)
@@ -358,8 +399,36 @@ def load_tasks(path: Path) -> list[Task]:
         except (TypeError, ValueError):
             raise MeasureError(f"{path}: task {task_id}: timeout must be a number of seconds") from None
         model = spec.get("model")
-        tasks.append(Task(task_id, prompt, cwd, list(expect), str(model) if model else None, list(tools), timeout))
+        tasks.append(Task(
+            task_id, prompt, cwd, list(expect), str(model) if model else None, list(tools), timeout,
+            expect_tools, forbid_tools, isolate, verify,
+        ))
     return tasks
+
+
+def prepare_workspace(task: Task) -> Path:
+    """Return the directory a run works in: the task's cwd, or a fresh copy of it."""
+    if not task.isolate:
+        return task.cwd
+    # A stable path per task keeps the transcripts of all its runs in one Claude Code project
+    # and leaves the last run's files for inspection.
+    workspace = state_dir() / "bench" / "workspaces" / task.id
+    shutil.rmtree(workspace, ignore_errors=True)
+    shutil.copytree(task.cwd, workspace, ignore=shutil.ignore_patterns("__pycache__", ".git"))
+    return workspace
+
+
+def run_verify(task: Task, workspace: Path) -> dict:
+    try:
+        proc = subprocess.run(
+            task.verify, capture_output=True, text=True, cwd=workspace, timeout=VERIFY_TIMEOUT,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return {"exit_code": None, "output": f"timed out after {VERIFY_TIMEOUT} s"}
+    except OSError as e:
+        return {"exit_code": None, "output": f"cannot run {task.verify[0]}: {e.strerror or e}"}
+    return {"exit_code": proc.returncode, "output": (proc.stdout + proc.stderr)[-VERIFY_OUTPUT_CHARS:]}
 
 
 def claude_command(task: Task, mode: str, session: str, claude: str, plugin_dir: Path) -> tuple[list[str], dict]:
@@ -393,10 +462,17 @@ def run_once(task: Task, mode: str, run: int, claude: str = "claude", plugin_dir
         "session_id": session,
         "model": task.model,
     }
+    for key in ("expect_tools", "forbid_tools"):
+        if getattr(task, key):
+            record[key] = getattr(task, key)
+    try:
+        workspace = prepare_workspace(task)
+    except OSError as e:
+        raise MeasureError(f"cannot copy {task.cwd} for task {task.id}: {e.strerror or e}") from None
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            cmd, input=task.prompt, capture_output=True, text=True, cwd=task.cwd, env=env, timeout=task.timeout
+            cmd, input=task.prompt, capture_output=True, text=True, cwd=workspace, env=env, timeout=task.timeout
         )
     except subprocess.TimeoutExpired:
         record["error"] = f"timed out after {task.timeout} s"
@@ -421,13 +497,19 @@ def run_once(task: Task, mode: str, run: int, claude: str = "claude", plugin_dir
         else:
             record["error"] = (proc.stderr or proc.stdout).strip()[:300] or f"exit code {proc.returncode}, no JSON output"
     record["duration_ms"] = int((time.monotonic() - started) * 1000)
-    if task.expect:
+    if task.checks_answer:
         answer = record.get("answer", "")
-        record["passed"] = "error" not in record and all(re.search(p, answer, re.IGNORECASE) for p in task.expect)
+        passed = "error" not in record and all(re.search(p, answer, re.IGNORECASE) for p in task.expect)
+        if task.verify and "error" not in record:
+            record["verify"] = run_verify(task, workspace)
+            passed = passed and record["verify"]["exit_code"] == 0
+        record["passed"] = passed
 
     transcript = find_transcript(session)
     if transcript is not None:
         record["claude"] = parse_transcript(transcript).to_dict()
+        if mode == "on" and (task.expect_tools or task.forbid_tools):
+            record["tool_check_failures"] = tool_check_failures(task, record["claude"]["tool_calls"])
     elif "error" not in record:
         record["error"] = "transcript not found"
     record["worker"] = asdict(worker_usage(session))

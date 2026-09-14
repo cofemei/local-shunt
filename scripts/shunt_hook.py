@@ -44,6 +44,19 @@ class Decision:
     rule: str
     info: FileInfo | None = None
     reason: str = ""
+    range_lines: int | None = None  # lines a wide ranged Read returns from a file over the threshold
+
+
+# Claude Code's Read returns this many lines when limit is not given.
+READ_DEFAULT_LIMIT = 2000
+
+
+def _positive_int(value) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 @dataclass
@@ -195,6 +208,25 @@ def _file_outline(path: Path) -> str:
     return build_outline(text.splitlines(), path.suffix)
 
 
+def _range_decision(path: Path, tool_input: dict, cfg: Config) -> Decision:
+    """Always allow a ranged Read, but note when the range spans at least min_lines of a large file.
+
+    A range that wide is effectively a full read; stats reports how often that happens.
+    The file is inspected only for such ranges, so narrow reads stay as fast as before.
+    """
+    limit = _positive_int(tool_input.get("limit")) or READ_DEFAULT_LIMIT
+    if limit < cfg.min_lines or path.suffix.lower() in NATIVE_EXTENSIONS:
+        return Decision(True, "range")
+    info = inspect_file(path)
+    if info is None or info.binary or info.lines is None:
+        return Decision(True, "range")
+    offset = _positive_int(tool_input.get("offset")) or 1
+    returned = max(0, min(limit, info.lines - offset + 1))
+    if info.lines < cfg.min_lines or returned < cfg.min_lines:
+        return Decision(True, "range")
+    return Decision(True, "range", info, range_lines=returned)
+
+
 def decide(
     event: dict,
     cfg: Config,
@@ -213,7 +245,7 @@ def decide(
         if not cfg.enabled:
             return Decision(True, "disabled")
         if tool_input.get("offset") is not None or tool_input.get("limit") is not None:
-            return Decision(True, "range")
+            return _range_decision(_resolve(path_str, cwd), tool_input, cfg)
         partial = None
     elif tool == "Bash":
         if not cfg.intercept_bash:
@@ -271,6 +303,8 @@ def handle_pre_tool_use(event: dict) -> dict | None:
     }
     if decision.info is not None:
         record.update(file=str(decision.info.path), lines=decision.info.lines, bytes=decision.info.bytes)
+    if decision.range_lines is not None:
+        record["range_lines"] = decision.range_lines
     log_event(record)
 
     if decision.allow:

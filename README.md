@@ -112,21 +112,22 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
    curl http://localhost:11434/api/tags
    ```
 
-3. 在 Claude Code 中加入 marketplace 並安裝 plugin：
-
-   ```text
-   /plugin marketplace add cofemei/local-shunt
-   /plugin install local-shunt@local-shunt
-   ```
-
-   也可以在終端機執行：
+3. 安裝 plugin。在終端機執行：
 
    ```bash
    claude plugin marketplace add cofemei/local-shunt
-   claude plugin install local-shunt@local-shunt
    ```
 
-   `cofemei/local-shunt` 是 GitHub repository，`local-shunt@local-shunt` 是「plugin 名稱@marketplace 名稱」。安裝完成後開啟新的工作階段。
+   這個命令會：
+   - 添加 `cofemei/local-shunt` GitHub repository 到 marketplace
+   - 自動安裝 `local-shunt@local-shunt` plugin
+
+   也可以在 Claude Code 中執行：
+   ```text
+   /plugin marketplace add cofemei/local-shunt
+   ```
+
+   安裝完成後開啟新的工作階段。
 
 4. 在 Claude Code 設定中允許 worker，避免每次呼叫都跳出權限確認：
 

@@ -98,6 +98,21 @@ class DecisionTest(IsolatedTestCase):
         self.assertIn("read src/big.py --question", d.reason)
         self.assertIn("limit=1000", d.reason)
 
+    def test_deny_reason_includes_outline(self):
+        source = "LIMIT = 50\n\n" + "".join(f"def f{i}():\n    return {i}\n\n" for i in range(200))
+        d = self.read(self.make("src/big.py", content=source))
+        self.assertIn("Outline of src/big.py", d.reason)
+        self.assertIn("L1           LIMIT = 50", d.reason)
+        self.assertIn("L3-L4        def f0():", d.reason)
+        self.assertIn("answer without reading more", d.reason)
+        self.assertIn(json.dumps(str(self.dir / "src" / "big.py")), d.reason)
+
+    def test_deny_reason_without_outline(self):
+        d = self.read(self.make("big.txt", 1000))
+        self.assertNotIn("Outline", d.reason)
+        self.assertNotIn("outline", d.reason)
+        self.assertIn("Read only the lines you need with offset/limit", d.reason)
+
     def test_oversized_file_suggests_grep(self):
         self.cfg.max_file_bytes = 50_000
         d = self.read(self.make("huge.log", 10_000))
@@ -247,6 +262,7 @@ class HookProcessTest(IsolatedTestCase):
             )
         text = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("local-shunt is active (provider openai-compatible, model fake-model", text)
+        self.assertIn("includes an outline of the file", text)
         self.assertNotIn("sent to that service", text)
 
     def test_session_start_inactive_reports_reason(self):

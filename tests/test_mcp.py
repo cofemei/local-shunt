@@ -65,6 +65,9 @@ class McpServerTest(IsolatedTestCase):
         tools = {t["name"]: t for t in self.request(proc, 2, "tools/list")["result"]["tools"]}
         self.assertEqual(set(tools), {"shunt_read", "shunt_write", "shunt_stats"})
         self.assertEqual(tools["shunt_read"]["inputSchema"]["required"], ["files", "question"])
+        # Only shunt_read skips tool search; the others stay deferred.
+        self.assertEqual(tools["shunt_read"]["_meta"], {"anthropic/alwaysLoad": True})
+        self.assertNotIn("_meta", tools["shunt_write"])
 
     def test_ping_and_unknown_method(self):
         proc = self.initialized()

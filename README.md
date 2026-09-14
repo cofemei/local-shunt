@@ -4,7 +4,7 @@ local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改�
 
 Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例如 OpenRouter、OpenAI、LM Studio、llama.cpp 或 vLLM。
 
-> **狀態**：v0.3.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。143 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
+> **狀態**：v0.3.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。154 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
 
 ## 目錄
 
@@ -256,6 +256,7 @@ local-shunt/
 │       └── SKILL.md           # 何時、如何委託產生樣板程式碼
 ├── scripts/
 │   ├── shunt_hook.py          # hook 進入點：判斷是否攔截、SessionStart 說明
+│   ├── outline.py             # 拒絕訊息中的檔案大綱
 │   ├── shunt.py               # worker CLI 與核心邏輯：read、write、stats、chunking
 │   ├── measure.py             # 代幣量測：transcript 解析、對照測試、報表
 │   ├── mcp_server.py          # MCP server：shunt_read、shunt_write、shunt_stats
@@ -273,6 +274,7 @@ local-shunt/
 │   ├── test_config.py         # 設定分層、金鑰解析、紀錄輪替
 │   ├── test_providers.py      # Ollama 與 OpenAI 相容 provider
 │   ├── test_worker.py         # chunking、行號驗證、read/write/stats、CLI
+│   ├── test_outline.py        # 各語言的大綱、區塊範圍、長度上限
 │   ├── test_measure.py        # transcript 解析、worker 紀錄對應、對照測試與報表
 │   └── test_mcp.py            # MCP 協定與工具呼叫
 ├── LICENSE                    # GNU GPL v3 授權全文
@@ -375,17 +377,26 @@ Hook 只處理**單一指令、單一檔案、沒有管線與重新導向**的�
 
 #### 攔截時的輸出
 
-Hook 以 JSON 輸出拒絕決定。拒絕原因會顯示給 Claude，因此包含可直接執行的指令與 worker 的絕對路徑：
+Hook 以 JSON 輸出拒絕決定。拒絕原因會顯示給 Claude，依成本由低到高列出下一步，並附上檔案大綱：
 
 ```json
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "local-shunt: argparse.py is large (2,676 lines, 102,058 bytes; threshold 350 lines or 32,768 bytes).\nDelegate the read to the worker model instead:\n  python3 /abs/path/scripts/shunt.py read argparse.py --question \"<what you need to know>\"\n(or call the shunt_read MCP tool with the same file and question, if available)\nThe result lists relevant line ranges. For exact text (e.g. before editing), Read with offset/limit.\nIf you truly need the whole file, Read it with offset=1 and limit=2676."
+    "permissionDecisionReason": "local-shunt: scripts/shunt.py is large (620 lines, 23,560 bytes; threshold 350 lines or 32,768 bytes).\nTake the cheapest next step that answers the question:\n- If the outline below already answers it, answer without reading more.\n- For exact text (e.g. before editing), Read only the lines you need with offset/limit, using the line ranges in the outline.\n- Otherwise delegate the read to the worker model: call the shunt_read MCP tool with files [\"/abs/path/scripts/shunt.py\"] and your question, or run:\n  python3 /abs/path/scripts/shunt.py read scripts/shunt.py --question \"<what you need to know>\"\nIf you truly need the whole file, Read it with offset=1 and limit=620.\n\nOutline of scripts/shunt.py (line range, then the definition or heading):\nL41          CHUNK_OVERLAP_LINES = 50\nL46-L47      class UsageError(Exception):\n..."
   }
 }
 ```
+
+大綱由 `scripts/outline.py` 產生，不呼叫模型：
+
+- 程式碼：以行首的樣式辨識 Python、JavaScript／TypeScript、Go、Rust、Ruby、Java／C#／Kotlin 的函式、類別與型別定義，以及 shell 函式。頂層的全大寫常數連同值一併列出。範圍以縮排判斷，`}` 與 Ruby 的 `end` 算在區塊內。
+- Markdown 與 reStructuredText：列出標題，範圍到下一個同級或更高級標題之前。
+- 大綱上限 3,000 字元。超過時先移除最深層的項目，仍超過則截斷並註明省略的項目數。
+- 沒有辨識到任何項目時（例如純文字檔），拒絕原因不含大綱。
+
+大綱讓 Claude 在被拒絕的同一輪取得行號：答案已在大綱中時直接回答，需要原文時只讀取相關範圍，只有問題涉及檔案大部分內容時才委託 worker。
 
 拒絕原因使用英文，因為讀者是 Claude，且需與 Claude Code 的其他工具訊息一致。指令中的路徑相對於工具呼叫的工作目錄。
 
@@ -402,7 +413,7 @@ Hook 以 JSON 輸出拒絕決定。拒絕原因會顯示給 Claude，因此包�
 
 工作階段開始時（包含 `--resume`），hook 連線檢查 worker，並輸出一段說明加入 Claude 的上下文：
 
-- 已啟用時：provider、模型、門檻、`shunt.py` 的絕對路徑、MCP 工具名稱，以及「輸出是未經驗證的摘要」的提醒
+- 已啟用時：provider、模型、門檻、`shunt.py` 的絕對路徑、MCP 工具名稱、「讀取被拒絕時會附上檔案大綱」的說明，以及「輸出是未經驗證的摘要」的提醒
 - 端點不在本機時：標示檔案內容會送往該服務
 - 無法使用時：說明原因，以及本次工作階段不會攔截
 - 已停用時：不輸出任何內容
@@ -649,6 +660,8 @@ python3 scripts/shunt.py bench-report <results.jsonl>...
 
 `.mcp.json` 註冊 `scripts/mcp_server.py`。它以 stdio 傳輸換行分隔的 JSON-RPC 2.0，只使用標準函式庫。在 Claude Code 中的完整工具名稱為 `mcp__plugin_local-shunt_local-shunt__<tool>`。
 
+Claude Code 預設延遲載入 MCP 工具的定義，Claude 必須先呼叫 `ToolSearch` 才能使用，多花一輪。`shunt_read` 在 `tools/list` 中設定 `_meta["anthropic/alwaysLoad"]`，工作階段開始時就載入定義；`shunt_write` 與 `shunt_stats` 仍延遲載入。
+
 | 工具 | 必要參數 | 選用參數 | 對應 |
 |---|---|---|---|
 | `shunt_read` | `files`（字串陣列）、`question` | `provider`、`model`、`max_output` | `shunt.py read` |
@@ -856,7 +869,8 @@ Provider 的預設值：
 
 - **摘要會遺漏資訊或出錯**：小模型擅長擷取表面結構，容易忽略執行緒安全、錯誤處理路徑、跨模組的隱含相依。實測中 `qwen3:8b` 曾把 `print_usage` 誤判為「印出用法並以錯誤結束」的方法。
 - **行號可能不準**：Worker 只能移除超出檔案範圍的行號，無法偵測範圍內但位置錯誤的行號。實測中 `qwen3:8b` 曾把位於 L97–L100 的程式碼標為 L107–L109。
-- **增加來回次數**：一次讀取可能變成「拒絕 → 委託 → 再讀原文」。每多一輪，Claude 都要重送整個上下文。實測中一次委託讓回合數從 2 增加到 4，Claude 的輸入代幣總數反而增加 60%，見[實測紀錄](#代幣量測shuntpy-bench)。
+- **增加來回次數**：Claude 通常不知道檔案大小，會先嘗試 `Read`，被拒絕後才改用其他方式，因此比直接讀取多一輪。每多一輪，Claude 都要重送整個上下文。拒絕訊息附上大綱、`shunt_read` 不延遲載入之後，範例任務的回合數中位數從 4 降為 3，但仍多於停用時的 2，見[實測紀錄](#代幣量測shuntpy-bench)。
+- **大綱是近似值**：以行首樣式與縮排判斷，不解析語法。多行字串中的 `def`、非常規縮排或巨集產生的程式碼可能被誤判。
 - **延遲**：本機 7B–8B 模型處理 4 萬代幣需要 15–18 秒；外部 API 約 10 秒，但會受速率限制影響。
 - **遠端設定錯誤發現得較晚**：Hook 不連線遠端端點。若 SessionStart 檢查之後服務才失效，hook 仍會攔截，worker 失敗後 Claude 必須自行改用 `offset`/`limit`。
 - **Bash 攔截不完整**：只涵蓋簡單形式，Claude 仍能以管線或其他指令讀取完整檔案。
@@ -876,11 +890,11 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 
 | 檔案 | 測試數 | 涵蓋範圍 |
 |---|---|---|
-| `test_decision.py` | 35 | 每一條判斷規則、Bash 指令解析、hook 行程的輸入輸出、遠端端點不連線、SessionStart 的啟用與停用訊息 |
+| `test_decision.py` | 37 | 每一條判斷規則、Bash 指令解析、拒絕訊息與大綱、hook 行程的輸入輸出、遠端端點不連線、SessionStart 的啟用與停用訊息 |
 | `test_config.py` | 23 | 設定分層、專案設定不能覆寫受信任的設定鍵、provider 預設值、dotenv 解析、金鑰解析順序、紀錄輪替 |
 | `test_providers.py` | 26 | 兩種 provider 的請求內容、關閉推理與自動移除、重試與放棄、錯誤訊息、健康檢查與快取 |
 | `test_worker.py` | 32 | Chunking 覆蓋每一行、行號驗證、read 的單次與 map-reduce 流程、write 的拒絕條件、stats、CLI exit code |
-| `test_mcp.py` | 11 | 初始化、工具清單、工具呼叫、參數驗證與容錯、錯誤回報、伺服器在錯誤訊息後繼續運作 |
+| `test_mcp.py` | 11 | 初始化、工具清單與 `alwaysLoad`、工具呼叫、參數驗證與容錯、錯誤回報、伺服器在錯誤訊息後繼續運作 |
 | `test_measure.py` | 16 | Transcript 去除重複與加總、subagent、工具分類與拒絕偵測、worker 紀錄的 session ID、任務檔驗證、以模擬的 `claude` 執行對照測試與報表 |
 
 ### 整合測試
@@ -896,8 +910,8 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 | 項目 | 條件 | 目前結果 |
 |---|---|---|
 | 失效時放行 | Worker 無法使用時，所有讀取都能完成 | 自動測試通過 |
-| Hook 延遲 | 放行判斷的 p95 低於 100 ms（不含首次健康檢查） | p95 49 ms |
-| 代幣節省 | 在 5 個以上的真實任務中，委託讀取的估計輸入代幣減少 70% 以上 | 可用 `bench` 量測。目前只有 1 項範例任務、各 1 次：減少 94%，但 Claude 的輸入代幣總數增加 60% |
+| Hook 延遲 | 放行判斷的 p95 低於 100 ms（不含首次健康檢查） | p95 49 ms；含大綱的 2 MB 檔案 p95 80 ms |
+| 代幣節省 | 在 5 個以上的真實任務中，委託讀取的估計輸入代幣減少 70% 以上 | 5 項範例任務（非真實任務）、各 2 次：減少 89%；Claude 的輸入代幣總數增加 6%，費用減少 55% |
 | 答案品質 | 同樣的任務，啟用與停用 plugin 的最終答案正確性一致 | 可用 `bench` 的 `expect` 比較，尚未系統性比較 |
 
 代幣節省的 70% 是本專案的目標值。目前的樣本只能證明量測機制可運作，不足以判斷是否達成。
@@ -920,6 +934,7 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 | OpenRouter `nvidia/nemotron-3.5-lightning:free`：`argparse.py`（`num_ctx` 131072，單次呼叫） | 約 39,917 → 375 代幣，10.7 s；引用的 L1826、L2639、L2656 均正確 |
 | `write`：4 個 `unittest` 測試案例（`qwen3:8b`） | 1.1 s，產生的測試全部通過 |
 | Hook 延遲（30 次） | 攔截與放行的中位數皆約 40 ms，p95 49 ms |
+| Hook 延遲，拒絕訊息含大綱（各 20 次，2026-09-14） | 620 行的檔案 p95 49 ms；約 2 MB、20,000 個函式的檔案 p95 80 ms |
 
 ### 端到端（`claude -p --plugin-dir`）
 
@@ -955,6 +970,31 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 
 樣本只有 1 項任務、各 1 次，只能驗證量測機制，不能作為代幣節省的結論。
 
+#### 減少額外回合（2026-09-14）
+
+同樣的環境，`bench/example-tasks.json` 的 5 項任務各執行 2 次。修改前為 v0.3.0；修改後的拒絕訊息附上檔案大綱，`shunt_read` 設定 `alwaysLoad`。表中為 5 項任務中位數的總和。
+
+| 指標 | 停用 | 修改前（啟用） | 修改後（啟用） |
+|---|---|---|---|
+| Claude 輸入代幣 | 203,152 | 298,824（+47%） | 216,624（+6%） |
+| 依價格加權的輸入代幣 | 191,720 | 81,486（−57%） | 70,770（−61%） |
+| 費用（USD） | 0.2144 | 0.1067（−50%） | 0.0918（−55%） |
+| 檔案讀取結果（估計） | 64,350 | 3,450（−95%） | 6,878（−89%） |
+
+| 啟用模式的 10 次執行 | 修改前 | 修改後 |
+|---|---|---|
+| 呼叫 `ToolSearch` | 10 | 0 |
+| 回合數 | 3–6，中位數 4 | 2–4，中位數 3 |
+| 以 2 回合完成（與停用相同） | 0 | 2 |
+| 呼叫 `shunt_read` | 10 | 3 |
+| 以 `offset`/`limit` 讀取範圍 | 1 | 5 |
+| 符合 `expect` | 10 | 10 |
+
+- 修改後，Claude 多半依大綱讀取相關範圍，而不是委託 worker；2 次直接從大綱回答。
+- 停用模式讀取整個檔案，觸發昂貴的快取寫入（1 小時快取為基本價格的 2 倍）；啟用模式的額外回合多為便宜的快取讀取（0.1 倍）。因此即使輸入代幣總數較多，費用仍較低。
+- 檔案讀取結果增加，是因為拒絕訊息包含大綱（約 600–800 代幣），以及改讀原文範圍。
+- 每種模式各 2 次，差異可能受雜訊影響。範例任務的問題都能從單一範圍回答，不代表真實任務。
+
 ## 待驗證事項
 
 以下行為影響設計。已在 Claude Code 2.1.270 上確認的項目已勾選：
@@ -974,7 +1014,8 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 | v0.1 | `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、兩個 skill、失效時放行 | 已實作 |
 | v0.2 | OpenAI 相容 API（OpenRouter、OpenAI、LM Studio 等）、金鑰管理、MCP server、紀錄輪替 | 已實作 |
 | v0.3 | 以 transcript 量測 Claude 的代幣用量（`usage`）、啟用與停用的對照測試（`bench`、`bench-report`）、worker 紀錄帶有工作階段 ID、從 GitHub marketplace 安裝、GitHub Actions（測試、plugin 驗證、gitleaks 金鑰掃描） | 已實作 |
-| 未定 | 以 `bench` 在真實任務上量測代幣節省與答案品質；減少委託造成的額外回合；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
+| 未發布 | 拒絕訊息附上檔案大綱；`shunt_read` 設定 `alwaysLoad`，省去 `ToolSearch` 的回合 | 已實作 |
+| 未定 | 以 `bench` 在真實任務上量測代幣節省與答案品質；進一步減少額外回合（Claude 仍會先嘗試 `Read`）；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
 
 ## 授權
 

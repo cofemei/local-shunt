@@ -49,6 +49,9 @@ TOOLS = [
             "required": ["files", "question"],
             "additionalProperties": False,
         },
+        # Load the schema up front: with tool search, a deferred tool costs Claude an extra
+        # ToolSearch turn right after a blocked read.
+        "_meta": {"anthropic/alwaysLoad": True},
     },
     {
         "name": "shunt_write",

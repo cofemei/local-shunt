@@ -20,3 +20,8 @@ description = "API key with an sk- prefix (OpenAI, Anthropic, OpenRouter, DeepSe
 regex = '''\bsk-[A-Za-z0-9][A-Za-z0-9_-]{30,}'''
 entropy = 3.5
 keywords = ["sk-"]
+
+# Prebuilt binaries are compiled from this repository; scanning them only adds noise.
+[[allowlists]]
+description = "prebuilt binaries"
+paths = ['''^dist/''']

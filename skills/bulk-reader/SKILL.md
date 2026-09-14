@@ -2,7 +2,7 @@
 name: bulk-reader
 description: Answer a question about large files by delegating the reading to a worker model (local Ollama or a configured API such as OpenRouter). Use when a Read of a large file was blocked by local-shunt, or before reading one or more large files (roughly 350+ lines) when you need specific facts from them rather than their exact text.
 allowed-tools:
-  - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" read *)
+  - Bash(bulk-read *)
   - mcp__plugin_local-shunt_local-shunt__shunt_read
 ---
 
@@ -15,12 +15,13 @@ A worker model reads the files and returns a short answer with line references. 
 If the `shunt_read` MCP tool is available, call it with `files` (absolute paths) and `question`. Otherwise run:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/shunt.py" read <file>... --question "<specific question>"
+bulk-read --question "<specific question>" --paths <file1> [<file2> ...]
 ```
 
 - Pass every file the question involves in one call.
+- Each call is independent. To ask a follow-up, ask again with the same `--paths`: the files go to the worker, never into your context, so re-sending them costs you only the answer.
 - Set the Bash timeout to 600000 ms for files over about 2,000 lines; the model may split them into parts.
-- Options: `--max-output <tokens>` (default 1024) for questions that need long lists; `--model <name>` and `--provider <name>` to override the configured worker. The MCP tool accepts the same options as `max_output`, `model` and `provider`.
+- Options: `--diff [SPEC]` also reads `git diff SPEC`; `--max-output <tokens>` (default 1024) for questions that need long lists; `--model <name>` and `--provider <name>` to override the configured worker. The MCP tool accepts the same options as `diff`, `max_output`, `model` and `provider`.
 
 ## Ask specific questions
 

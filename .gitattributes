@@ -1,0 +1,5 @@
+# The launcher scripts run under sh, also from Git Bash on Windows: keep LF line endings.
+bin/* text eol=lf
+*.sh text eol=lf
+.githooks/* text eol=lf
+dist/** binary

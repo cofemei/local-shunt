@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/shunt_hook.py\" pre-tool-use",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/local-shunt\" hook pre-tool-use",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/shunt_hook.py\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/local-shunt\" hook session-start",
             "timeout": 10
           }
         ]

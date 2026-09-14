@@ -34,37 +34,74 @@ jobs:
           claude plugin validate --strict .claude-plugin/plugin.json
           claude plugin validate --strict .
 
-  unittest:
-    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+  gotest:
+    name: Go tests on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-        include:
-          - os: macos-latest
-            python: "3.10"
-          - os: macos-latest
-            python: "3.14"
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-go@v6
         with:
-          python-version: ${{ matrix.python }}
+          go-version-file: go.mod
 
       # The tests need no Ollama, network or API keys: they use a local fake LLM server
-      # and a fake `claude` executable.
-      - name: Check JSON files
-        run: |
-          for f in .claude-plugin/plugin.json hooks/hooks.json .mcp.json bench/*.json; do
-            python -m json.tool "$f" > /dev/null || { echo "::error file=$f::invalid JSON"; exit 1; }
-          done
+      # and the test binary itself as a fake `claude` executable.
+      - name: Vet
+        run: go vet ./...
 
-      - name: Compile
-        run: python -m compileall -q scripts tests
+      - name: Check formatting
+        if: runner.os != 'Windows'
+        run: test -z "$(gofmt -l .)"
 
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        run: go test ./...
+
+  binaries:
+    name: Build binaries and run the launcher on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Check JSON files
+        run: |
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json .mcp.json bench/*.json; do
+            node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$f" || { echo "::error file=$f::invalid JSON"; exit 1; }
+          done
+
+      - name: Committed binaries exist for every platform
+        run: |
+          for p in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do test -x "dist/$p/local-shunt"; done
+          for p in windows-amd64 windows-arm64; do test -f "dist/$p/local-shunt.exe"; done
+
+      - name: Build all platforms
+        run: scripts/build.sh
+
+      - name: Run the hook and the commands through the launchers
+        env:
+          LOCAL_SHUNT_MODEL: none
+          OLLAMA_HOST: http://127.0.0.1:9
+        run: |
+          bin/local-shunt version
+          bin/bulk-read --help | grep -q -- --paths
+          bin/code-write --help | grep -q -- --reference
+          # The worker is unreachable, so the hook must allow the read and print nothing.
+          out=$(printf '{"tool_name":"Read","tool_input":{"file_path":"README.md"},"cwd":"%s"}' "$PWD" | bin/local-shunt hook pre-tool-use)
+          test -z "$out"
+          printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | bin/local-shunt mcp | grep -q '"result":{}'

@@ -1,0 +1,40 @@
+#!/bin/sh
+# Run the prebuilt local-shunt binary for this platform from dist/<os>-<arch>/.
+# A copy of this script named bulk-read or code-write runs that command.
+set -eu
+
+self=$0
+case $self in */*) ;; *) self=./$self ;; esac
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *) self=${self%/*}/$link ;;
+    esac
+done
+root=$(cd "${self%/*}/.." && pwd -P)
+
+case $(uname -s) in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    MINGW* | MSYS* | CYGWIN*) os=windows ;;
+    *) echo "local-shunt: unsupported operating system $(uname -s)" >&2; exit 1 ;;
+esac
+case $(uname -m) in
+    x86_64 | amd64) arch=amd64 ;;
+    arm64 | aarch64) arch=arm64 ;;
+    *) echo "local-shunt: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+exe=$root/dist/$os-$arch/local-shunt
+[ "$os" = windows ] && exe=$exe.exe
+if [ ! -x "$exe" ]; then
+    echo "local-shunt: no binary for $os-$arch at $exe; build it with scripts/build.sh" >&2
+    exit 1
+fi
+
+export LOCAL_SHUNT_ROOT="$root"
+case ${self##*/} in
+    bulk-read | code-write) exec "$exe" "${self##*/}" "$@" ;;
+    *) exec "$exe" "$@" ;;
+esac

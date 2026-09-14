@@ -25,6 +25,7 @@ Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例
 - [實測紀錄](#實測紀錄)
 - [待驗證事項](#待驗證事項)
 - [開發路線](#開發路線)
+- [授權](#授權)
 - [參考資料](#參考資料)
 
 本文件的規範用語：**必須**表示必要要求，**不得**表示禁止，**應**表示建議，**可以**表示可選。
@@ -221,6 +222,7 @@ local-shunt/
 │   ├── test_providers.py      # Ollama 與 OpenAI 相容 provider
 │   ├── test_worker.py         # chunking、行號驗證、read/write/stats、CLI
 │   └── test_mcp.py            # MCP 協定與工具呼叫
+├── LICENSE                    # GNU GPL v3 授權全文
 └── README.md
 ```
 
@@ -233,8 +235,8 @@ local-shunt/
   "name": "local-shunt",
   "version": "0.2.0",
   "description": "Delegate large file reads to a worker model (local Ollama or an OpenAI-compatible API such as OpenRouter) to save Claude tokens",
-  "author": { "name": "<YOUR_NAME>" },
-  "license": "MIT",
+  "author": { "name": "cofemei" },
+  "license": "GPL-3.0-or-later",
   "keywords": ["ollama", "openrouter", "tokens", "hooks", "mcp", "local-llm"]
 }
 ```
@@ -796,6 +798,14 @@ python3 -m unittest discover -s tests
 | v0.1 | `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、兩個 skill、失效時放行 | 已實作 |
 | v0.2 | OpenAI 相容 API（OpenRouter、OpenAI、LM Studio 等）、金鑰管理、MCP server、紀錄輪替 | 已實作 |
 | 未定 | 在真實任務上量測代幣節省與答案品質；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
+
+## 授權
+
+Copyright (C) 2026 cofemei
+
+本程式是自由軟體：你可以依據自由軟體基金會發布的 GNU 通用公共授權條款（GNU General Public License）第 3 版，或（依你的選擇）任何更新的版本，重新散布或修改本程式。
+
+本程式散布的目的是希望它有用，但**不提供任何擔保**，也不包含適售性或特定用途適用性的默示擔保。詳見 [`LICENSE`](LICENSE)。
 
 ## 參考資料
 

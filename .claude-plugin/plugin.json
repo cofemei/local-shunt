@@ -2,7 +2,7 @@
   "name": "local-shunt",
   "version": "0.2.0",
   "description": "Delegate large file reads to a worker model (local Ollama or an OpenAI-compatible API such as OpenRouter) to save Claude tokens",
-  "author": { "name": "<YOUR_NAME>" },
-  "license": "MIT",
+  "author": { "name": "cofemei" },
+  "license": "GPL-3.0-or-later",
   "keywords": ["ollama", "openrouter", "tokens", "hooks", "mcp", "local-llm"]
 }

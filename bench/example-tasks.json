@@ -1,0 +1,34 @@
+{
+  "defaults": {
+    "cwd": "..",
+    "model": "haiku",
+    "timeout": 600
+  },
+  "tasks": [
+    {
+      "id": "chunk-overlap",
+      "prompt": "In scripts/shunt.py, when a file is too large for one worker request, how many lines do adjacent chunks overlap, and which function builds the chunks? Answer in one or two sentences.",
+      "expect": ["\\b50\\b", "build_chunks"]
+    },
+    {
+      "id": "invalid-line-refs",
+      "prompt": "In scripts/shunt.py, what happens to a line reference such as L9999 in the worker model's answer when the file has only 500 lines? Name the function that handles it. Answer briefly.",
+      "expect": ["validate_line_refs"]
+    },
+    {
+      "id": "cache-multipliers",
+      "prompt": "In scripts/measure.py, which multipliers are used to price-weight cache writes and cache reads? Answer briefly.",
+      "expect": ["1\\.25", "0\\.1"]
+    },
+    {
+      "id": "log-rotation",
+      "prompt": "According to README.md, where is the local-shunt log file stored by default, and at what size is it rotated? Answer briefly.",
+      "expect": ["log\\.jsonl", "10\\s*MB"]
+    },
+    {
+      "id": "trusted-keys",
+      "prompt": "According to README.md, which configuration keys are read only from the user config and the environment, never from a project config? List them.",
+      "expect": ["api_base", "api_key_env", "ollama_host", "extra_body"]
+    }
+  ]
+}

@@ -4,7 +4,7 @@ local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改�
 
 Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例如 OpenRouter、OpenAI、LM Studio、llama.cpp 或 vLLM。
 
-> **狀態**：v0.2.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider，以及 bulk-reader 與 code-writer 兩個 skill。127 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
+> **狀態**：v0.2.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。143 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
 
 ## 目錄
 
@@ -67,7 +67,7 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
 - 預設在本機執行：使用 Ollama 時不產生額外 API 費用，檔案內容不離開本機。
 - 使用者明確設定後，可以改用外部 API，並在每個工作階段開始時標示資料的去向。
 - 失效時放行：worker 無法使用時，Claude 照常讀取檔案，不中斷工作。
-- 可量測：記錄每次委託的檔案大小、摘要長度、延遲與 API 費用，用實際資料調整門檻。
+- 可量測：記錄每次委託的檔案大小、摘要長度、延遲與 API 費用，並以 transcript 與對照測試量測 Claude 實際消耗的代幣，用實際資料調整門檻。
 
 ### 非目標
 
@@ -208,9 +208,12 @@ local-shunt/
 ├── scripts/
 │   ├── shunt_hook.py          # hook 進入點：判斷是否攔截、SessionStart 說明
 │   ├── shunt.py               # worker CLI 與核心邏輯：read、write、stats、chunking
+│   ├── measure.py             # 代幣量測：transcript 解析、對照測試、報表
 │   ├── mcp_server.py          # MCP server：shunt_read、shunt_write、shunt_stats
 │   ├── providers.py           # Ollama 與 OpenAI 相容 API、重試、健康檢查
 │   └── common.py              # 設定載入、金鑰解析、路徑比對、檔案檢查、紀錄
+├── bench/
+│   └── example-tasks.json     # 對照測試的範例任務
 ├── prompts/
 │   ├── read.md                # 讀取的系統提示
 │   ├── read_reduce.md         # chunking 合併階段的系統提示
@@ -221,6 +224,7 @@ local-shunt/
 │   ├── test_config.py         # 設定分層、金鑰解析、紀錄輪替
 │   ├── test_providers.py      # Ollama 與 OpenAI 相容 provider
 │   ├── test_worker.py         # chunking、行號驗證、read/write/stats、CLI
+│   ├── test_measure.py        # transcript 解析、worker 紀錄對應、對照測試與報表
 │   └── test_mcp.py            # MCP 協定與工具呼叫
 ├── LICENSE                    # GNU GPL v3 授權全文
 └── README.md
@@ -499,7 +503,98 @@ Hook 不強制使用 code-writer。是否委託由 Claude 依 `skills/code-write
 python3 scripts/shunt.py stats [--since 2026-09-01] [--session <id>]
 ```
 
-輸出 hook 判斷的分布、委託讀取次數、原始與摘要的估計代幣數、節省比例、worker 實際回報的代幣數、平均延遲、各模型的使用次數、API 回報的費用，以及錯誤分布。
+輸出 hook 判斷的分布、委託讀取次數、原始與摘要的估計代幣數、節省比例、worker 實際回報的代幣數、平均延遲、各模型的使用次數、API 回報的費用，以及錯誤分布。節省比例是估計值，Claude 實際消耗的代幣見下一節。
+
+### shunt.py usage 與 bench：量測 Claude 的代幣用量
+
+`stats` 的節省比例只比較原始檔案與摘要的估計代幣數，沒有計入攔截造成的額外來回。`usage` 與 `bench` 改用 Claude 實際計費的代幣數。
+
+#### usage：單一工作階段的用量
+
+```bash
+python3 scripts/shunt.py usage [<session-id> | <transcript.jsonl>]... [--json]
+```
+
+不指定參數時，讀取目前的工作階段（環境變數 `CLAUDE_CODE_SESSION_ID`）。
+
+資料來源是 Claude Code 的 transcript：`~/.claude/projects/<專案>/<session-id>.jsonl`，以及同名目錄下 `subagents/` 中的 subagent transcript。設定了 `CLAUDE_CONFIG_DIR` 時，改從該目錄尋找。
+
+| 項目 | 來源 | 說明 |
+|---|---|---|
+| API 請求數 | transcript 的 `usage` | Claude Code 把一則回應拆成多筆紀錄，以訊息 ID 去除重複 |
+| 輸入代幣 | transcript 的 `usage` | 未快取、快取寫入與快取讀取的總和 |
+| 依價格加權的輸入代幣 | transcript 的 `usage` | 未快取 ×1、5 分鐘快取寫入 ×1.25、1 小時快取寫入 ×2、快取讀取 ×0.1 |
+| 輸出代幣 | transcript 的 `usage` | 包含 thinking |
+| 工具呼叫次數與結果代幣數 | `tool_use`、`tool_result` | 結果代幣數為估計值。`Read` 依有無 `offset`/`limit` 分成兩類；`shunt.py read` 與 `shunt_read` 各自統計 |
+| Hook 拒絕次數 | `tool_result` | 含 local-shunt 拒絕訊息的錯誤結果 |
+| Worker 用量 | `log.jsonl` | 以 session ID 篩選 |
+
+單一工作階段無法得知停用 plugin 時的用量，因此 `usage` 不計算節省比例。
+
+#### bench：啟用與停用的對照測試
+
+```bash
+python3 scripts/shunt.py bench bench/example-tasks.json [--runs 3] [--task <id>]... [--out <file>] [--claude <path>]
+python3 scripts/shunt.py bench-report <results.jsonl>...
+```
+
+`bench` 以 `claude -p` 執行任務檔中的每個任務，啟用與停用 local-shunt 各執行 `--runs` 次，最後輸出報表。每次執行完成後，結果立即寫入 `--out`，預設為 `$XDG_STATE_HOME/local-shunt/bench/<時間>.jsonl`。中途中斷時，`bench-report` 仍可彙整已完成的結果。
+
+**`bench` 會呼叫 Claude API 並產生費用**，執行次數為任務數 × `--runs` × 2。啟用模式會把檔案內容送往設定的 worker。結果檔包含 Claude 的最終答案。
+
+任務檔格式：
+
+```json
+{
+  "defaults": { "cwd": "..", "model": "haiku", "timeout": 600 },
+  "tasks": [
+    {
+      "id": "chunk-overlap",
+      "prompt": "In scripts/shunt.py, when a file is too large for one worker request, how many lines do adjacent chunks overlap, and which function builds the chunks?",
+      "expect": ["\\b50\\b", "build_chunks"]
+    }
+  ]
+}
+```
+
+| 欄位 | 必要 | 說明 |
+|---|---|---|
+| `id` | 是 | 英文字母、數字、`.`、`_` 或 `-` |
+| `prompt` | 是 | 送給 Claude 的提示，經由 stdin 傳入 |
+| `cwd` | 否 | 工作目錄。相對路徑以任務檔所在目錄為準，預設為任務檔所在目錄 |
+| `expect` | 否 | 正規表示式清單。最終答案符合全部規則（不分大小寫）才算通過 |
+| `model` | 否 | 傳給 `--model`。未指定時使用 Claude Code 的預設模型 |
+| `allowed_tools` | 否 | 傳給 `--allowedTools`。預設為 `Read`、`Grep`、`Glob`、`Bash(python3 <shunt.py 路徑> read:*)` 與 `shunt_read` |
+| `timeout` | 否 | 單次執行的秒數上限，預設 900 |
+
+`defaults` 的欄位套用到每個任務，任務中的同名欄位優先。`bench/example-tasks.json` 提供 5 個以本 repository 檔案為題的範例任務，預設使用 Haiku。
+
+為了讓兩種模式只差在 local-shunt 是否生效，`bench` 採用以下做法：
+
+- 兩種模式都以 `--plugin-dir` 載入 plugin，Claude 看到的工具清單相同。停用模式設定 `LOCAL_SHUNT_DISABLE=1`，並以 `--disallowedTools` 禁用 `shunt_read` 與 `shunt_write`。
+- 每次執行以 `--session-id` 指定新的 session ID，執行後讀取對應的 transcript。
+- 兩種模式的執行順序每輪交替，避免提示快取的狀態只對其中一種模式有利。
+- 報表取中位數。輸入代幣總數同時計入快取讀取與寫入，不受快取狀態影響，是主要指標。
+
+| 報表指標 | 說明 |
+|---|---|
+| `input tokens` | Claude 的輸入代幣總數，包含每一輪重送的上下文 |
+| `input tokens, price-weighted` | 依快取價格加權的輸入代幣 |
+| `output tokens` | Claude 的輸出代幣 |
+| `file-read result tokens (est.)` | `Read`、`shunt.py read` 與 `shunt_read` 結果的估計代幣數，對應[驗收條件](#驗收條件)的「委託讀取的輸入代幣」 |
+| `cost USD` | `claude -p` 回報的費用 |
+| `turns`、`duration s` | 回合數與執行時間 |
+| `delegations / hook denials` | 委託次數與 hook 拒絕次數 |
+| `answers passed` | 符合 `expect` 的次數 |
+
+報表在以下情況列出警告：
+
+- 停用模式仍使用了 worker，對照組的資料不可用
+- 啟用模式從未委託讀取，任務沒有測到 local-shunt
+- 啟用模式符合 `expect` 的次數少於停用模式
+- 任一模式沒有成功完成的執行，該任務不計入總計
+
+報表不包含 worker 模型的代幣。Worker 用量記錄在每筆結果的 `worker` 欄位。
 
 ### MCP server
 
@@ -652,7 +747,7 @@ Provider 的預設值：
 ```json
 {
   "ts": "2026-09-13T22:27:24+08:00",
-  "session_id": null,
+  "session_id": "71ee1c2c-4ec1-4bd3-9d33-1573b3d4e962",
   "event": "read",
   "files": ["argparse.py"],
   "lines": 2676,
@@ -678,7 +773,7 @@ Provider 的預設值：
 | `prompt_tokens`、`completion_tokens` | Worker 模型實際回報的代幣數，包含系統提示與 chunking 的所有呼叫 |
 | `cost_usd` | API 回報的費用；Ollama 與不回報費用的服務為 `null` |
 
-`event` 為 `hook` 的紀錄由 hook 寫入，帶有 `session_id`。`event` 為 `read`、`write` 的紀錄由 worker 寫入。Worker 的執行環境沒有工作階段 ID，因此這類紀錄的 `session_id` 為 `null`，`stats --session` 只會篩選到 hook 紀錄。
+`event` 為 `hook` 的紀錄由 hook 寫入，`event` 為 `read`、`write` 的紀錄由 worker 寫入。兩者的 `session_id` 都是 Claude Code 的工作階段 ID：hook 從事件輸入取得，worker 從 Claude Code 傳給 Bash 工具與 MCP server 的環境變數 `CLAUDE_CODE_SESSION_ID` 取得。在 Claude Code 之外執行 worker 時，`session_id` 為 `null`。
 
 紀錄檔超過 10 MB 時改名為 `log.jsonl.1`，覆蓋前一份。健康檢查結果快取在同一目錄的 `health.json`。
 
@@ -707,11 +802,11 @@ Provider 的預設值：
 
 - **摘要會遺漏資訊或出錯**：小模型擅長擷取表面結構，容易忽略執行緒安全、錯誤處理路徑、跨模組的隱含相依。實測中 `qwen3:8b` 曾把 `print_usage` 誤判為「印出用法並以錯誤結束」的方法。
 - **行號可能不準**：Worker 只能移除超出檔案範圍的行號，無法偵測範圍內但位置錯誤的行號。實測中 `qwen3:8b` 曾把位於 L97–L100 的程式碼標為 L107–L109。
-- **增加來回次數**：一次讀取可能變成「拒絕 → 委託 → 再讀原文」。檔案略大於門檻時，節省的代幣可能不足以抵銷。
+- **增加來回次數**：一次讀取可能變成「拒絕 → 委託 → 再讀原文」。每多一輪，Claude 都要重送整個上下文。實測中一次委託讓回合數從 2 增加到 4，Claude 的輸入代幣總數反而增加 60%，見[實測紀錄](#代幣量測shuntpy-bench)。
 - **延遲**：本機 7B–8B 模型處理 4 萬代幣需要 15–18 秒；外部 API 約 10 秒，但會受速率限制影響。
 - **遠端設定錯誤發現得較晚**：Hook 不連線遠端端點。若 SessionStart 檢查之後服務才失效，hook 仍會攔截，worker 失敗後 Claude 必須自行改用 `offset`/`limit`。
 - **Bash 攔截不完整**：只涵蓋簡單形式，Claude 仍能以管線或其他指令讀取完整檔案。
-- **代幣數為估計值**：節省比例使用字元數估算，不等於 Claude 實際計費的代幣數。
+- **`stats` 的節省比例為估計值**：以字元數估算，也沒有計入額外的來回。Claude 實際計費的代幣數以 `usage` 或 `bench` 量測。
 
 ## 測試與驗收
 
@@ -730,6 +825,7 @@ python3 -m unittest discover -s tests
 | `test_providers.py` | 26 | 兩種 provider 的請求內容、關閉推理與自動移除、重試與放棄、錯誤訊息、健康檢查與快取 |
 | `test_worker.py` | 32 | Chunking 覆蓋每一行、行號驗證、read 的單次與 map-reduce 流程、write 的拒絕條件、stats、CLI exit code |
 | `test_mcp.py` | 11 | 初始化、工具清單、工具呼叫、參數驗證與容錯、錯誤回報、伺服器在錯誤訊息後繼續運作 |
+| `test_measure.py` | 16 | Transcript 去除重複與加總、subagent、工具分類與拒絕偵測、worker 紀錄的 session ID、任務檔驗證、以模擬的 `claude` 執行對照測試與報表 |
 
 ### 整合測試
 
@@ -745,10 +841,12 @@ python3 -m unittest discover -s tests
 |---|---|---|
 | 失效時放行 | Worker 無法使用時，所有讀取都能完成 | 自動測試通過 |
 | Hook 延遲 | 放行判斷的 p95 低於 100 ms（不含首次健康檢查） | p95 49 ms |
-| 代幣節省 | 在 5 個以上的真實任務中，委託讀取的估計輸入代幣減少 70% 以上 | 尚未以真實任務量測 |
-| 答案品質 | 同樣的任務，啟用與停用 plugin 的最終答案正確性一致 | 尚未系統性比較 |
+| 代幣節省 | 在 5 個以上的真實任務中，委託讀取的估計輸入代幣減少 70% 以上 | 可用 `bench` 量測。目前只有 1 項範例任務、各 1 次：減少 94%，但 Claude 的輸入代幣總數增加 60% |
+| 答案品質 | 同樣的任務，啟用與停用 plugin 的最終答案正確性一致 | 可用 `bench` 的 `expect` 比較，尚未系統性比較 |
 
-代幣節省的 70% 是本專案的目標值，不是已量測的結果。
+代幣節省的 70% 是本專案的目標值。目前的樣本只能證明量測機制可運作，不足以判斷是否達成。
+
+這項條件只計算檔案讀取結果，不計入額外來回。判斷 plugin 是否真正減少 Claude 的代幣，應同時看 `bench` 報表的 `input tokens`。
 
 ## 實測紀錄
 
@@ -779,6 +877,28 @@ python3 -m unittest discover -s tests
 
 代幣數為 worker 的估計值，不是 Claude 的計費代幣數。
 
+### 代幣量測（`shunt.py bench`）
+
+測試環境：2026-09-14，Claude Code 2.1.270，Claude Haiku 4.5，worker 為 OpenRouter `nvidia/nemotron-3.5-lightning:free`。任務為 `bench/example-tasks.json` 的 `chunk-overlap`（`scripts/shunt.py`，616 行），啟用與停用各執行 1 次。
+
+| 指標 | 啟用 | 停用 | 差異 |
+|---|---|---|---|
+| 檔案讀取結果（估計） | 493 | 8,598 | −94.3% |
+| Claude 輸入代幣 | 55,284 | 34,614 | +59.7% |
+| 依價格加權的輸入代幣 | 33,221 | 28,685 | +15.8% |
+| 輸出代幣 | 691 | 626 | +10.4% |
+| 費用（USD） | 0.0377 | 0.0329 | +14.8% |
+| 回合數 | 4 | 2 | — |
+| 執行時間 | 16.2 s | 9.4 s | — |
+| 答案符合 `expect` | 1/1 | 1/1 | — |
+
+- 停用模式：`Read` 讀取整個檔案，然後回答。
+- 啟用模式：`Read` 被 hook 拒絕 → 以 `ToolSearch` 載入延遲載入的 `shunt_read` → 呼叫 `shunt_read` → 回答。
+- 每一輪都重送約 14,000 代幣的系統提示與上下文。多出的兩輪抵銷了讀取結果省下的約 8,100 代幣。
+- `claude -p` 回報的 `usage` 與 transcript 的加總相同。Worker 紀錄的 `session_id` 與 transcript 相符。
+
+樣本只有 1 項任務、各 1 次，只能驗證量測機制，不能作為代幣節省的結論。
+
 ## 待驗證事項
 
 以下行為影響設計。已在 Claude Code 2.1.270 上確認的項目已勾選：
@@ -789,7 +909,7 @@ python3 -m unittest discover -s tests
 - [x] Plugin 的 MCP 工具名稱為 `mcp__plugin_local-shunt_local-shunt__<tool>`。
 - [ ] SessionStart 的說明在 `/clear` 與自動壓縮後是否同樣加入上下文。`claude -p` 無法測試 `/clear`。
 - [ ] Plugin 是否能宣告 `permissions.allow`，省去[安裝](#安裝)步驟 4。
-- [ ] Hook 的 `session_id` 能否傳給 worker，讓 `stats --session` 涵蓋 worker 紀錄。
+- [x] Worker 能取得工作階段 ID。Claude Code 傳給 Bash 工具與 MCP server 的環境變數 `CLAUDE_CODE_SESSION_ID` 即為工作階段 ID，`stats --session` 與 `usage` 因此涵蓋 worker 紀錄。
 
 ## 開發路線
 
@@ -797,7 +917,8 @@ python3 -m unittest discover -s tests
 |---|---|---|
 | v0.1 | `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、兩個 skill、失效時放行 | 已實作 |
 | v0.2 | OpenAI 相容 API（OpenRouter、OpenAI、LM Studio 等）、金鑰管理、MCP server、紀錄輪替 | 已實作 |
-| 未定 | 在真實任務上量測代幣節省與答案品質；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
+| 未發布 | 以 transcript 量測 Claude 的代幣用量（`usage`）；啟用與停用的對照測試（`bench`、`bench-report`）；worker 紀錄帶有工作階段 ID | 已實作 |
+| 未定 | 以 `bench` 在真實任務上量測代幣節省與答案品質；減少委託造成的額外回合；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
 
 ## 授權
 

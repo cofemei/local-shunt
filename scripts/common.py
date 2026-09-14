@@ -306,6 +306,11 @@ def estimate_tokens(text: str) -> int:
     return (len(text) - non_ascii) // 3 + non_ascii
 
 
+def session_id() -> str | None:
+    """Claude Code session ID inherited from the environment (Bash tool or MCP server)."""
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or None
+
+
 def state_dir() -> Path:
     base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     return base / "local-shunt"

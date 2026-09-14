@@ -4,6 +4,9 @@
     shunt.py read <file>... --question "..." [--provider NAME] [--model NAME] [--max-output N]
     shunt.py write --out PATH --spec "..." [--context FILE...] [--force] [--provider NAME] [--model NAME]
     shunt.py stats [--since YYYY-MM-DD] [--session ID]
+    shunt.py usage [SESSION_ID | TRANSCRIPT.jsonl]... [--json]
+    shunt.py bench TASKS.json [--runs N] [--task ID...] [--out FILE] [--claude PATH]
+    shunt.py bench-report RESULTS.jsonl...
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import os
 import re
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,9 +32,11 @@ from common import (  # noqa: E402
     load_config,
     log_event,
     now_ms,
+    session_id,
     state_dir,
 )
 from providers import LLMError, Provider, get_provider  # noqa: E402
+import measure  # noqa: E402
 
 CHUNK_OVERLAP_LINES = 50
 EXIT_USAGE = 2
@@ -308,7 +313,7 @@ def run_read(cfg: Config, files: list[str], question: str, max_output: int | Non
     output = f"## local-shunt: {title}\n\n{answer}\n\n---\n" + " · ".join(notes)
 
     log_event({
-        "session_id": os.environ.get("CLAUDE_SESSION_ID"),
+        "session_id": session_id(),
         "event": "read",
         "files": [src.shown for src in sources],
         "lines": sum(len(src.lines) for src in sources),
@@ -399,7 +404,7 @@ def run_write(
     line_count = content.count("\n")
     elapsed = (now_ms() - started) / 1000
     log_event({
-        "session_id": os.environ.get("CLAUDE_SESSION_ID"),
+        "session_id": session_id(),
         "event": "write",
         "files": [display_path(out_path)],
         "lines": line_count,
@@ -477,8 +482,52 @@ def run_stats(since: str | None = None, session: str | None = None) -> str:
     if errors:
         lines += ["", "Errors"]
         lines += [f"  {outcome:<32} {count:>8,}" for outcome, count in errors.most_common()]
-    lines += ["", "Source and summary token counts are estimates, not Claude's billed tokens."]
+    lines += [
+        "",
+        "Source and summary token counts are estimates, not Claude's billed tokens.",
+        "For billed tokens use `shunt.py usage` (one session) or `shunt.py bench` (on/off comparison).",
+    ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- measurement
+
+
+def run_usage(refs: list[str], as_json: bool = False) -> str:
+    refs = refs or [ref for ref in [session_id()] if ref]
+    if not refs:
+        raise UsageError("pass a session ID or transcript path (no Claude Code session in the environment)")
+    records = measure.read_log()
+    reports = []
+    for ref in refs:
+        transcript = measure.find_transcript(ref)
+        if transcript is None:
+            raise UsageError(f"{ref}: transcript not found under {measure.claude_home() / 'projects'}")
+        claude = measure.parse_transcript(transcript)
+        worker = measure.worker_usage(claude.session_id, records)
+        if as_json:
+            reports.append(json.dumps({"claude": claude.to_dict(), "worker": asdict(worker)}, ensure_ascii=False))
+        else:
+            reports.append(measure.format_usage(claude, worker))
+    return "\n".join(reports) if as_json else "\n\n".join(reports)
+
+
+def run_bench(task_file: str, runs: int, only: list[str] | None, out: str | None, claude: str) -> str:
+    try:
+        results = measure.run_bench(
+            resolve_path(task_file), runs, resolve_path(out) if out else None, only, claude, progress
+        )
+        report = measure.format_report(measure.load_results([results]))
+    except measure.MeasureError as e:
+        raise UsageError(str(e)) from None
+    return f"{report}\n\nResults: {results}"
+
+
+def run_bench_report(paths: list[str]) -> str:
+    try:
+        return measure.format_report(measure.load_results([resolve_path(p) for p in paths]))
+    except measure.MeasureError as e:
+        raise UsageError(str(e)) from None
 
 
 # ---------------------------------------------------------------- main
@@ -509,6 +558,20 @@ def build_parser() -> argparse.ArgumentParser:
     stats = sub.add_parser("stats", help="summarize the local-shunt log")
     stats.add_argument("--since", help="YYYY-MM-DD")
     stats.add_argument("--session")
+
+    usage = sub.add_parser("usage", help="Claude's token usage in a session, from its transcript")
+    usage.add_argument("sessions", nargs="*", help="session IDs or transcript paths (default: the current session)")
+    usage.add_argument("--json", action="store_true")
+
+    bench = sub.add_parser("bench", help="run tasks through claude -p with local-shunt on and off")
+    bench.add_argument("tasks", help="task file (JSON)")
+    bench.add_argument("--runs", type=int, default=3, help="runs per task and mode (default 3)")
+    bench.add_argument("--task", action="append", dest="only", metavar="ID", help="run only this task (repeatable)")
+    bench.add_argument("--out", help="results file (default: $XDG_STATE_HOME/local-shunt/bench/<time>.jsonl)")
+    bench.add_argument("--claude", default="claude", help="claude executable")
+
+    report = sub.add_parser("bench-report", help="summarize benchmark results")
+    report.add_argument("results", nargs="+")
     return parser
 
 
@@ -520,7 +583,7 @@ def execute(command: str, cfg: Config, run) -> tuple[int, str]:
         return EXIT_USAGE, f"local-shunt: {e}"
     except LLMError as e:
         log_event({
-            "session_id": os.environ.get("CLAUDE_SESSION_ID"),
+            "session_id": session_id(),
             "event": command,
             "provider": cfg.provider,
             "model": cfg.model,
@@ -540,6 +603,12 @@ def main(argv: list[str] | None = None) -> int:
         run = lambda: run_read(cfg, args.files, args.question, args.max_output)  # noqa: E731
     elif args.command == "write":
         run = lambda: run_write(cfg, args.out, args.spec, args.context, args.force, args.max_output)  # noqa: E731
+    elif args.command == "usage":
+        run = lambda: run_usage(args.sessions, args.json)  # noqa: E731
+    elif args.command == "bench":
+        run = lambda: run_bench(args.tasks, args.runs, args.only, args.out, args.claude)  # noqa: E731
+    elif args.command == "bench-report":
+        run = lambda: run_bench_report(args.results)  # noqa: E731
     else:
         run = lambda: run_stats(args.since, args.session)  # noqa: E731
     code, text = execute(args.command, cfg, run)

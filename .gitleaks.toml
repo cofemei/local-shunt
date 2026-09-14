@@ -1,0 +1,22 @@
+# Secret scanning rules for gitleaks: the built-in rules plus the key formats this
+# project handles. Used by .githooks/pre-commit and .github/workflows/secrets.yml.
+
+title = "local-shunt"
+
+[extend]
+useDefault = true
+
+# The default rules only catch OpenRouter keys next to a key-like variable name, so
+# a key inside "api_keys" in config.json slips through.
+[[rules]]
+id = "openrouter-api-key"
+description = "OpenRouter API key"
+regex = '''\bsk-or-v1-[a-f0-9]{64}\b'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
+id = "sk-prefixed-api-key"
+description = "API key with an sk- prefix (OpenAI, Anthropic, OpenRouter, DeepSeek and others)"
+regex = '''\bsk-[A-Za-z0-9][A-Za-z0-9_-]{30,}'''
+entropy = 3.5
+keywords = ["sk-"]

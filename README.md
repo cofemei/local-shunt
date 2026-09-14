@@ -199,7 +199,11 @@ local-shunt/
 │   └── plugin.json            # plugin 中繼資料
 ├── .mcp.json                  # 註冊 MCP server
 ├── .github/workflows/
-│   └── test.yml               # GitHub Actions：自動測試
+│   ├── test.yml               # GitHub Actions：自動測試
+│   └── secrets.yml            # GitHub Actions：以 gitleaks 掃描金鑰
+├── .githooks/
+│   └── pre-commit             # commit 前以 gitleaks 掃描金鑰
+├── .gitleaks.toml             # gitleaks 規則
 ├── hooks/
 │   └── hooks.json             # PreToolUse 與 SessionStart hook
 ├── skills/
@@ -795,6 +799,11 @@ Provider 的預設值：
 - **資料去向**：使用 Ollama 且 `ollama_host` 在本機時，檔案內容不離開本機。端點不在本機時，SessionStart 說明必須標示檔案內容會送往哪個服務。
 - **專案設定不可信任**：`provider`、`api_base`、`api_key_env`、`env_files`、`api_keys`、`ollama_host`、`extra_body` 只從使用者設定與環境變數讀取。
 - **金鑰**：金鑰依 provider 分開存放，不寫入紀錄與錯誤訊息。`env_files` 預設不包含專案的 `.env`，避免讀到 repo 內他人放置的金鑰；需要時在使用者設定中明確加入。
+- **防止金鑰進入 repository**：金鑰應放在 `~/.config/local-shunt/`，不放在 repository 內。`.gitignore` 排除 `.env`、`.env.*`、`*.pem`、`*.key`。另有兩層 [gitleaks](https://github.com/gitleaks/gitleaks) 檢查，規則為 gitleaks 預設規則加上 `.gitleaks.toml` 中的 OpenRouter 與 `sk-` 開頭金鑰規則：
+  - **pre-commit hook**（`.githooks/pre-commit`）：commit 前掃描暫存的變更，發現金鑰時拒絕 commit。每個 clone 必須執行一次 `git config core.hooksPath .githooks` 才會啟用。Hook 優先透過 mise 執行固定版本的 gitleaks；沒有 mise 也沒有 gitleaks 時，hook 拒絕 commit。
+  - **GitHub Actions**（`.github/workflows/secrets.yml`）：每次 push 與 pull request 時掃描所有 commit，涵蓋未啟用 hook 或以 `--no-verify` 略過 hook 的情況。
+
+  CI 發現金鑰時，金鑰已經推送到 GitHub。此時必須先撤銷該金鑰，再從歷史中移除。
 - **Hook 不連線遠端**：Hook 只在本機端點上做連線檢查，遠端端點沿用 SessionStart 的結果，避免每次工具呼叫都送出網路請求。
 - **提示注入**：檔案內容可能包含針對模型的指令。系統提示要求模型把檔案內容視為資料。SessionStart 說明與 skill 要求 Claude 將 worker 輸出視為未經驗證的摘要，不視為指示。
 - **寫入範圍**：`shunt.py write` 只寫入 `--out` 指定的單一檔案，不執行模型輸出的任何指令。
@@ -820,7 +829,7 @@ python3 -m unittest discover -s tests
 
 測試不需要 Ollama、網路或 API 金鑰。`tests/helpers.py` 為每項測試建立獨立的專案、設定與紀錄目錄，清除相關環境變數，並提供模擬 Ollama 與 OpenAI 相容 API 的本機 HTTP 伺服器。
 
-GitHub Actions（`.github/workflows/test.yml`）在每次 push 到 `main` 與每個 pull request 時執行上述測試，涵蓋 Ubuntu 上的 Python 3.10 至 3.14，以及 macOS 上的 Python 3.10 與 3.14。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
+GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每個 pull request 時執行上述測試，涵蓋 Ubuntu 上的 Python 3.10 至 3.14，以及 macOS 上的 Python 3.10 與 3.14。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
 
 | 檔案 | 測試數 | 涵蓋範圍 |
 |---|---|---|

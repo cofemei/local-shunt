@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+# Secrets: keep API keys in ~/.config/local-shunt/, never in the repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.claude/settings.local.json

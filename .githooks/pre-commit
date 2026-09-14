@@ -1,0 +1,31 @@
+#!/bin/sh
+# Block commits that contain API keys or other secrets.
+# Enable once per clone: git config core.hooksPath .githooks
+set -u
+
+GITLEAKS_VERSION=8.30.1
+LEAKS_FOUND=3
+root=$(git rev-parse --show-toplevel)
+
+if command -v mise >/dev/null 2>&1; then
+    set -- mise exec "gitleaks@$GITLEAKS_VERSION" -- gitleaks
+elif command -v gitleaks >/dev/null 2>&1; then
+    set -- gitleaks
+else
+    echo "pre-commit: gitleaks is not installed, so the commit is blocked." >&2
+    echo "Install gitleaks $GITLEAKS_VERSION (https://github.com/gitleaks/gitleaks#installing) or mise, then commit again." >&2
+    exit 1
+fi
+
+"$@" git --pre-commit --staged --redact --verbose --no-banner --log-level warn \
+    --exit-code "$LEAKS_FOUND" --config "$root/.gitleaks.toml" "$root"
+status=$?
+
+if [ "$status" -eq "$LEAKS_FOUND" ]; then
+    echo "pre-commit: possible secret in the staged changes; the commit is blocked." >&2
+    echo "Unstage it with 'git restore --staged <file>' and keep keys in ~/.config/local-shunt/ instead." >&2
+    exit 1
+elif [ "$status" -ne 0 ]; then
+    echo "pre-commit: gitleaks failed (exit code $status), so the commit is blocked." >&2
+    exit 1
+fi

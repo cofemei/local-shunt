@@ -198,6 +198,8 @@ local-shunt/
 ├── .claude-plugin/
 │   └── plugin.json            # plugin 中繼資料
 ├── .mcp.json                  # 註冊 MCP server
+├── .github/workflows/
+│   └── test.yml               # GitHub Actions：自動測試
 ├── hooks/
 │   └── hooks.json             # PreToolUse 與 SessionStart hook
 ├── skills/
@@ -817,6 +819,8 @@ python3 -m unittest discover -s tests
 ```
 
 測試不需要 Ollama、網路或 API 金鑰。`tests/helpers.py` 為每項測試建立獨立的專案、設定與紀錄目錄，清除相關環境變數，並提供模擬 Ollama 與 OpenAI 相容 API 的本機 HTTP 伺服器。
+
+GitHub Actions（`.github/workflows/test.yml`）在每次 push 到 `main` 與每個 pull request 時執行上述測試，涵蓋 Ubuntu 上的 Python 3.10 至 3.14，以及 macOS 上的 Python 3.10 與 3.14。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
 
 | 檔案 | 測試數 | 涵蓋範圍 |
 |---|---|---|

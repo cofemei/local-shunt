@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import PROVIDERS, apply_overrides, load_config  # noqa: E402
 from shunt import execute, run_read, run_stats, run_write  # noqa: E402
 
-SERVER_INFO = {"name": "local-shunt", "version": "0.2.0"}
+SERVER_INFO = {"name": "local-shunt", "version": "0.3.0"}
 LATEST_PROTOCOL = "2025-06-18"
 
 MODEL_PROPS = {

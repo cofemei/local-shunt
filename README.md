@@ -4,7 +4,7 @@ local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改�
 
 Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例如 OpenRouter、OpenAI、LM Studio、llama.cpp 或 vLLM。
 
-> **狀態**：v0.2.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。143 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
+> **狀態**：v0.3.0。已實作 `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。143 項自動測試全部通過。實測結果見[實測紀錄](#實測紀錄)。
 
 ## 目錄
 
@@ -286,7 +286,7 @@ local-shunt/
 ```json
 {
   "name": "local-shunt",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Delegate large file reads to a worker model (local Ollama or an OpenAI-compatible API such as OpenRouter) to save Claude tokens",
   "author": { "name": "cofemei" },
   "license": "GPL-3.0-or-later",
@@ -973,7 +973,7 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 |---|---|---|
 | v0.1 | `Read`／`Bash` 攔截、`shunt.py read`（含 chunking）、`write`、`stats`、兩個 skill、失效時放行 | 已實作 |
 | v0.2 | OpenAI 相容 API（OpenRouter、OpenAI、LM Studio 等）、金鑰管理、MCP server、紀錄輪替 | 已實作 |
-| 未發布 | 以 transcript 量測 Claude 的代幣用量（`usage`）；啟用與停用的對照測試（`bench`、`bench-report`）；worker 紀錄帶有工作階段 ID | 已實作 |
+| v0.3 | 以 transcript 量測 Claude 的代幣用量（`usage`）、啟用與停用的對照測試（`bench`、`bench-report`）、worker 紀錄帶有工作階段 ID、從 GitHub marketplace 安裝、GitHub Actions（測試、plugin 驗證、gitleaks 金鑰掃描） | 已實作 |
 | 未定 | 以 `bench` 在真實任務上量測代幣節省與答案品質；減少委託造成的額外回合；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
 
 ## 授權

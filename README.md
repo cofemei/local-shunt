@@ -1083,7 +1083,7 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 | v0.1 | `Read`／`Bash` 攔截、`read`（含 chunking）、`write`、`stats`、兩個 skill、失效時放行 | 已實作 |
 | v0.2 | OpenAI 相容 API（OpenRouter、OpenAI、LM Studio 等）、金鑰管理、MCP server、紀錄輪替 | 已實作 |
 | v0.3 | 以 transcript 量測 Claude 的代幣用量（`usage`）、啟用與停用的對照測試（`bench`、`bench-report`）、worker 紀錄帶有工作階段 ID、從 GitHub marketplace 安裝、GitHub Actions（測試、plugin 驗證、gitleaks 金鑰掃描） | 已實作 |
-| v0.4（未發布） | 拒絕訊息附上檔案大綱；`shunt_read` 設定 `alwaysLoad`，省去 `ToolSearch` 的回合；以 Go 改寫並附上預先編譯的執行檔，不需安裝 Python；`bulk-read` 與 `code-write` 指令（`code-write` 可輸出到 stdout） | 已實作 |
+| v0.4 | 拒絕訊息附上檔案大綱；`shunt_read` 設定 `alwaysLoad`，省去 `ToolSearch` 的回合；以 Go 改寫並附上預先編譯的執行檔，不需安裝 Python；`bulk-read` 與 `code-write` 指令（`code-write` 可輸出到 stdout）；新增 OrcaRouter provider；修正多個 Go 重寫後的安全性與可靠性問題（bash 攔截漏洞、專案設定可繞過信任邊界、逾時重試、CLI 參數解析） | 已實作 |
 | 未定 | 以 `bench` 在真實任務上量測代幣節省與答案品質；進一步減少額外回合（Claude 仍會先嘗試 `Read`）；依統計資料自動調整門檻；摘要中錯誤行號的偵測（例如比對識別字是否出現在引用範圍內） | 未開始 |
 
 ## 授權

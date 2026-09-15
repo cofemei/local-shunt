@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "local-shunt--v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing local-shunt--v* tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^local-shunt--v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Tag must be local-shunt--v<major>.<minor>.<patch>; got $TAG"
+            exit 1
+          }
+          version=${TAG#local-shunt--v}
+          test "$(jq -r .version .claude-plugin/plugin.json)" = "$version"
+          test "$(jq -r .version codex-marketplace/plugins/local-shunt/.codex-plugin/plugin.json)" = "$version"
+          grep -Fqx "const Version = \"$version\"" internal/shunt/config.go
+
+      - name: Test
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)"
+          go test ./...
+
+      - name: Build release binaries
+        run: scripts/build.sh
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${TAG#local-shunt--v}
+          mkdir release
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            tar -C "dist/$target" -czf "release/local-shunt_${version}_${target}.tar.gz" local-shunt
+          done
+          for target in windows-amd64 windows-arm64; do
+            zip -j "release/local-shunt_${version}_${target}.zip" "dist/$target/local-shunt.exe"
+          done
+          (cd release && sha256sum * > checksums.txt)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* \
+              --verify-tag \
+              --title "local-shunt ${TAG#local-shunt--v}" \
+              --generate-notes
+          fi

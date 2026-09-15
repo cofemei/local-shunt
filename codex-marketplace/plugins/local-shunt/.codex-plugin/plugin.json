@@ -1,6 +1,6 @@
 {
   "name": "local-shunt",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Delegate large file reads to a local or compatible worker model to reduce context use.",
   "author": {
     "name": "cofemei",

@@ -4,7 +4,7 @@ local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改�
 
 Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例如 OpenRouter、OpenAI、LM Studio、llama.cpp 或 vLLM。
 
-> **狀態**：v0.4.0。以 Go 撰寫，plugin 內附 Linux、macOS 與 Windows 的預先編譯執行檔，**不需安裝 Python、Go 或任何套件**。已實作 `Read`／`Bash` 攔截、`bulk-read`（含 chunking）、`code-write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。實測結果見[實測紀錄](#實測紀錄)。
+> **狀態**：v0.4.1。以 Go 撰寫，plugin 內附 Linux、macOS 與 Windows 的預先編譯執行檔，**不需安裝 Python、Go 或任何套件**。已實作 `Read`／`Bash` 攔截、`bulk-read`（含 chunking）、`code-write`、`stats`、MCP server、外部 API provider、Claude 代幣用量的量測（`usage`、`bench`），以及 bulk-reader 與 code-writer 兩個 skill。實測結果見[實測紀錄](#實測紀錄)。
 
 ```bash
 bulk-read --question "What does this service do?" --paths src/Service.java src/Handler.java
@@ -368,7 +368,7 @@ local-shunt/
 ```json
 {
   "name": "local-shunt",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Delegate large file reads to a worker model (local Ollama or an OpenAI-compatible API such as OpenRouter) to save Claude tokens",
   "author": { "name": "cofemei" },
   "license": "GPL-3.0-or-later",

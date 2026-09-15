@@ -19,6 +19,29 @@ func source(name string, count int) *SourceFile {
 	return &SourceFile{Shown: name, Lines: lines}
 }
 
+// TestReduceFindingsGuardsAgainstNoProgress ensures a merge budget too small to ever
+// batch two findings together fails fast instead of looping forever re-calling the LLM.
+func TestReduceFindingsGuardsAgainstNoProgress(t *testing.T) {
+	isolate(t)
+	f := newFakeLLM(t)
+	cfg := DefaultConfig()
+	cfg.Provider, cfg.OllamaHost, cfg.Model, cfg.NumCtx = "ollama", f.URL, "fake", 10
+	llm, err := getProvider(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings := []finding{
+		{"part1", strings.Repeat("a", 500)},
+		{"part2", strings.Repeat("b", 500)},
+	}
+	_, calls, err := reduceFindings(llm, "q", findings, 1, &usage{})
+	if err == nil {
+		t.Fatal("expected an error instead of looping forever")
+	}
+	contain(t, err.Error(), "exceed the merge budget")
+	equal(t, calls, 0) // caught before making any LLM call
+}
+
 func TestSmallFilesShareAChunk(t *testing.T) {
 	chunks := buildChunks([]*SourceFile{source("a.py", 10), source("b.py", 10)}, 10_000)
 	equal(t, len(chunks), 1)
@@ -510,6 +533,30 @@ func TestCLIErrors(t *testing.T) {
 
 	code, _, _ = runCLI(t, "", "nope")
 	equal(t, code, 2)
+}
+
+// TestCLIShortFlagNotSwallowedAsValue guards against a registered short flag (like -q)
+// being silently consumed as another flag's value instead of raising "needs a value".
+func TestCLIShortFlagNotSwallowedAsValue(t *testing.T) {
+	e := isolate(t)
+	e.make("a.py", 10)
+	code, _, stderr := runCLI(t, "", "bulk-read", "--paths", "a.py", "--question", "-q")
+	equal(t, code, 2)
+	contain(t, stderr, "--question needs a value")
+}
+
+// TestCLIFlagListAllowsZeroValues matches the old CLI's nargs="*": --reference with no
+// following files is an empty list, not a parse error.
+func TestCLIFlagListAllowsZeroValues(t *testing.T) {
+	isolate(t)
+	f := newFakeLLM(t)
+	f.reply = func(map[string]any) string { return "```java\nclass Empty {}\n```" }
+	t.Setenv("OLLAMA_HOST", f.URL)
+	t.Setenv("LOCAL_SHUNT_MODEL", "fake")
+	code, stdout, stderr := runCLI(t, "", "code-write", "--reference", "--spec", "Generate a stub")
+	equal(t, code, 0)
+	equal(t, stdout, "class Empty {}\n")
+	contain(t, stderr, "local-shunt: generated")
 }
 
 func TestCLIProviderFlagOverridesConfig(t *testing.T) {

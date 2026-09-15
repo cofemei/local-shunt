@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -149,37 +150,64 @@ func TestDecideBashRules(t *testing.T) {
 	}
 }
 
+// TestDecideBashMultiFile guards against a large file among several `cat` arguments
+// slipping through just because it isn't the only one named.
+func TestDecideBashMultiFile(t *testing.T) {
+	e := isolate(t)
+	cfg := hookConfig()
+	e.make("small.py", 10)
+	e.make("big.py", 1000)
+
+	equal(t, decide(bashEvent(e, "cat small.py big.py"), cfg, healthy).Allow, false)
+	equal(t, decide(bashEvent(e, "cat big.py small.py"), cfg, healthy).Allow, false)
+	expectRule(t, decide(bashEvent(e, "cat small.py"), cfg, mustNotCheckHealth(t)), true, "below-threshold")
+}
+
+// TestDecideBashGlob guards against a shell glob (which the real shell expands) being
+// treated as a literal, nonexistent filename and waved through as "not-found".
+func TestDecideBashGlob(t *testing.T) {
+	e := isolate(t)
+	cfg := hookConfig()
+	e.make("logs/app.log", 1000)
+	e.make("logs/small.log", 10)
+
+	equal(t, decide(bashEvent(e, "cat logs/*.log"), cfg, healthy).Allow, false)
+	expectRule(t, decide(bashEvent(e, "cat nosuchdir/*.log"), cfg, mustNotCheckHealth(t)), true, "not-found")
+}
+
 func TestParseBashRead(t *testing.T) {
 	type want struct {
-		path            string
+		paths           []string
 		maxLines, bytes int
 	}
 	for command, w := range map[string]want{
-		"cat a.py":             {"a.py", -1, -1},
-		"cat -n a.py":          {"a.py", -1, -1},
-		"head a.py":            {"a.py", 10, -1},
-		"head -n 20 a.py":      {"a.py", 20, -1},
-		"head -n20 a.py":       {"a.py", 20, -1},
-		"head -20 a.py":        {"a.py", 20, -1},
-		"head --lines=20 a.py": {"a.py", 20, -1},
-		"head -c 100 a.py":     {"a.py", -1, 100},
-		"tail -n +5 a.py":      {"a.py", -1, -1},
-		"head -n -5 a.py":      {"a.py", -1, -1},
-		"less a.py":            {"a.py", -1, -1},
-		"/bin/cat a.py":        {"a.py", -1, -1},
-		"cat 'my file.py'":     {"my file.py", -1, -1},
+		"cat a.py":             {[]string{"a.py"}, -1, -1},
+		"cat -n a.py":          {[]string{"a.py"}, -1, -1},
+		"cat a.py b.py":        {[]string{"a.py", "b.py"}, -1, -1},
+		"head a.py":            {[]string{"a.py"}, 10, -1},
+		"head -n 20 a.py":      {[]string{"a.py"}, 20, -1},
+		"head -n20 a.py":       {[]string{"a.py"}, 20, -1},
+		"head -20 a.py":        {[]string{"a.py"}, 20, -1},
+		"head --lines=20 a.py": {[]string{"a.py"}, 20, -1},
+		"head -c 100 a.py":     {[]string{"a.py"}, -1, 100},
+		"tail -n +5 a.py":      {[]string{"a.py"}, -1, -1},
+		"head -n -5 a.py":      {[]string{"a.py"}, -1, -1},
+		"less a.py":            {[]string{"a.py"}, -1, -1},
+		"/bin/cat a.py":        {[]string{"a.py"}, -1, -1},
+		"cat 'my file.py'":     {[]string{"my file.py"}, -1, -1},
+		"cat *.log":            {[]string{"*.log"}, -1, -1},
 	} {
 		parsed := parseBashRead(command)
 		if parsed == nil {
 			t.Errorf("%q: not recognized", command)
 			continue
 		}
-		if (want{parsed.path, parsed.maxLines, parsed.maxBytes}) != w {
+		if !slices.Equal(parsed.paths, w.paths) || parsed.maxLines != w.maxLines || parsed.maxBytes != w.bytes {
 			t.Errorf("%q: got %+v, want %+v", command, *parsed, w)
 		}
 	}
 	for _, command := range []string{
-		"cat a.py b.py", "cat a.py > b.py", "cd x && cat a.py", "tail -f app.log", "head -x a.py",
+		"cat a.py > b.py", "cd x && cat a.py", "tail -f app.log", "head -x a.py",
 		"cat $FILE", `cat "unterminated`, "grep foo a.py", "", "head -n",
 	} {
 		if parseBashRead(command) != nil {

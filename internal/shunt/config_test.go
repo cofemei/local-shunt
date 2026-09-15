@@ -19,13 +19,15 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 func TestLoadConfigLayers(t *testing.T) {
 	e := isolate(t)
-	e.writeUserConfig(map[string]any{"min_lines": 100, "model": "user-model", "num_ctx": 8192})
-	e.writeProjectConfig(map[string]any{"min_lines": 200, "exclude": []string{"**/gen/**"}})
+	e.writeUserConfig(map[string]any{"min_lines": 100, "model": "user-model", "num_ctx": 8192, "exclude": []string{"**/gen/**"}})
+	e.writeProjectConfig(map[string]any{"min_lines": 200})
 	t.Setenv("LOCAL_SHUNT_MIN_LINES", "300")
 	cfg := LoadConfig("")
 	equal(t, cfg.MinLines, 300)
 	equal(t, cfg.Model, "user-model")
 	equal(t, cfg.NumCtx, 8192)
+	// exclude is trusted (TestProjectConfigCannotRedirectDataOrKeys covers a project
+	// config trying to set it), so only the user config's value takes effect here.
 	if !reflect.DeepEqual(cfg.Exclude, []string{"**/gen/**"}) {
 		t.Errorf("exclude = %v", cfg.Exclude)
 	}
@@ -42,6 +44,7 @@ func TestProjectConfigCannotRedirectDataOrKeys(t *testing.T) {
 		"api_keys":    map[string]string{"openrouter": "x"},
 		"ollama_host": "http://attacker.example:11434",
 		"extra_body":  map[string]string{"model": "expensive"},
+		"exclude":     []string{},
 		"min_lines":   123,
 	})
 	cfg := LoadConfig("")
@@ -54,6 +57,11 @@ func TestProjectConfigCannotRedirectDataOrKeys(t *testing.T) {
 	equal(t, len(cfg.APIKeys), 0)
 	equal(t, cfg.OllamaHost, "http://localhost:11434")
 	equal(t, len(cfg.ExtraBody), 0)
+	// A project config emptying "exclude" must not strip the defaults that keep
+	// secrets (.env, CLAUDE.md, lockfiles) from being sent to the worker.
+	if !reflect.DeepEqual(cfg.Exclude, defaultExclude) {
+		t.Errorf("exclude = %v, want defaults %v", cfg.Exclude, defaultExclude)
+	}
 	equal(t, cfg.MinLines, 123)
 }
 
@@ -122,6 +130,13 @@ func TestApplyOverrides(t *testing.T) {
 	equal(t, cfg.APIKeyEnv, "OPENROUTER_API_KEY")
 	equal(t, cfg.Model, "m")
 	equal(t, ApplyOverrides(LoadConfig(""), "openai-compatible", "").APIBase, "http://127.0.0.1:1234/v1")
+
+	// Switching away from a provider with a preset key variable must clear it, even
+	// though the target provider (ollama/openai-compatible) has no preset of its own —
+	// otherwise a stale APIKeyEnv from the previously configured provider survives.
+	e.writeUserConfig(map[string]any{"provider": "openrouter"})
+	stale := ApplyOverrides(LoadConfig(""), "openai-compatible", "")
+	equal(t, stale.APIKeyEnv, "")
 }
 
 func TestConfigProblem(t *testing.T) {

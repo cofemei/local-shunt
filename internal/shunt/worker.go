@@ -485,6 +485,13 @@ func reduceFindings(llm *Provider, question string, findings []finding, maxOutpu
 			used += cost
 		}
 
+		// Every batch holding exactly one finding means the budget can't fit two
+		// findings together, so this pass would merge 1-for-1 and never shrink the
+		// list — looping again would just repeat the same non-progress forever.
+		if len(batches) == len(findings) && len(findings) > 1 {
+			return "", calls, llmError(kindLLM, "reduceFindings: %d findings each exceed the merge budget (%d tokens); cannot batch or reduce further", len(findings), budget)
+		}
+
 		var merged []finding
 		for i, batch := range batches {
 			bodies := make([]string, len(batch))

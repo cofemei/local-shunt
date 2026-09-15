@@ -1,7 +1,9 @@
 package shunt
 
 import (
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func chatResponse(content any, finish string, message map[string]any) fakeResponse {
@@ -222,6 +224,34 @@ func TestRemoteRetriesThenSucceeds(t *testing.T) {
 	equal(t, len(f.chatRequests()), 3)
 }
 
+// TestRemoteRetriesAfterTimeout guards against a one-off slow response permanently
+// failing the whole call: a request timeout on a remote endpoint should be retried
+// like any other transient failure, not treated as "the model stays slow forever".
+func TestRemoteRetriesAfterTimeout(t *testing.T) {
+	isolate(t)
+	f := newFakeLLM(t)
+	var first atomic.Bool
+	first.Store(true)
+	f.handler = func(fakeRequest) fakeResponse {
+		if first.CompareAndSwap(true, false) {
+			// The client gives up after RequestTimeout and retries; this goroutine
+			// (serving the abandoned first request) keeps sleeping harmlessly.
+			time.Sleep(1500 * time.Millisecond)
+		}
+		return chatResponse("ok", "stop", nil)
+	}
+	cfg := compatConfig(f, "openai-compatible")
+	cfg.RequestTimeout = 1
+	llm := mustProvider(t, cfg)
+	llm.IsLocal = false
+	result, err := llm.Chat("s", "u", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	equal(t, result.Text, "ok")
+	equal(t, len(f.chatRequests()), 2)
+}
+
 func TestRemoteGivesUpAfterMaxRetries(t *testing.T) {
 	isolate(t)
 	f := newFakeLLM(t)
@@ -325,6 +355,23 @@ func TestCompatWithoutModelsEndpointIsAssumedOK(t *testing.T) {
 	f := newFakeLLM(t)
 	f.handler = func(fakeRequest) fakeResponse {
 		return fakeResponse{404, map[string]any{"error": "no such route"}, nil}
+	}
+	cfg := compatConfig(f, "openai-compatible")
+	cfg.Model = "anything"
+	equal(t, checkHealth(cfg, healthOptions{noCache: true}).OK, true)
+}
+
+// TestCompatModelsMalformedResponseIsAssumedOK guards against a healthy server whose
+// /models response doesn't match the expected {"data": [...]} shape being misreported
+// as "model not available".
+func TestCompatModelsMalformedResponseIsAssumedOK(t *testing.T) {
+	isolate(t)
+	f := newFakeLLM(t)
+	f.handler = func(r fakeRequest) fakeResponse {
+		if r.Path == "/v1/models" {
+			return fakeResponse{200, map[string]any{"unexpected": "shape"}, nil}
+		}
+		return f.defaultResponse(r)
 	}
 	cfg := compatConfig(f, "openai-compatible")
 	cfg.Model = "anything"

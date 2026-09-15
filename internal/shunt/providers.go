@@ -34,7 +34,7 @@ var (
 const (
 	kindLLM         = "LLMError"
 	kindModelOutput = "ModelOutputError" // the request succeeded but the output is unusable; retrying will not help
-	kindTimeout     = "RequestTimeout"   // a slow model stays slow, so this is not retried
+	kindTimeout     = "RequestTimeout"   // retried like any transient remote failure (a one-off network stall isn't a slow model)
 	kindHTTPStatus  = "HTTPStatusError"
 )
 
@@ -249,7 +249,7 @@ func (p *Provider) Chat(system, user string, maxOutput int) (ChatResult, error) 
 			if e.RetryAfter != nil && *e.RetryAfter <= 60 {
 				delay = time.Duration(*e.RetryAfter * float64(time.Second))
 			}
-		case kindModelOutput, kindTimeout:
+		case kindModelOutput:
 			return result, err
 		}
 		sleep(delay)
@@ -277,7 +277,10 @@ func (p *Provider) listModels(timeout time.Duration) (names []string, ok bool, e
 		}
 		return nil, false, err
 	}
-	models, _ := data["data"].([]any)
+	models, ok := data["data"].([]any)
+	if !ok {
+		return nil, false, nil // response doesn't match the expected shape; cannot verify
+	}
 	for _, m := range models {
 		if obj, isObj := m.(map[string]any); isObj {
 			names = append(names, asString(obj["id"]))

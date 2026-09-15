@@ -48,12 +48,13 @@ var providerPresets = map[string]providerPreset{
 	"openai-compatible": {},
 	"openrouter":        {apiBase: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY"},
 	"openai":            {apiBase: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY"},
+	"orcarouter":        {apiBase: "https://api.orcarouter.ai/v1", apiKeyEnv: "ORCAROUTER_API_KEY"},
 }
 
 // providerNames lists the presets in documentation order; sortedProviderNames in sorted order.
 var (
-	providerNames       = []string{"ollama", "openai-compatible", "openrouter", "openai"}
-	sortedProviderNames = []string{"ollama", "openai", "openai-compatible", "openrouter"}
+	providerNames       = []string{"ollama", "openai-compatible", "openrouter", "openai", "orcarouter"}
+	sortedProviderNames = []string{"ollama", "openai", "openai-compatible", "openrouter", "orcarouter"}
 )
 
 // Config is the merged local-shunt configuration.
@@ -113,7 +114,7 @@ func DefaultConfig() Config {
 // config file and the environment.
 var trustedKeys = map[string]bool{
 	"provider": true, "api_base": true, "api_key_env": true, "env_files": true,
-	"api_keys": true, "ollama_host": true, "extra_body": true,
+	"api_keys": true, "ollama_host": true, "extra_body": true, "exclude": true,
 }
 
 var envMap = [][2]string{
@@ -412,9 +413,10 @@ func ApplyOverrides(cfg Config, provider, model string) Config {
 		if preset.apiBase != "" {
 			cfg.APIBase = preset.apiBase
 		}
-		if cfg.Provider == "openrouter" || cfg.Provider == "openai" {
-			cfg.APIKeyEnv = preset.apiKeyEnv
-		}
+		// Always reset to the new provider's key variable (possibly ""), even for
+		// providers with no preset (ollama, openai-compatible) — otherwise a stale
+		// APIKeyEnv from a previously configured provider survives the switch.
+		cfg.APIKeyEnv = preset.apiKeyEnv
 	}
 	if model != "" {
 		cfg.Model = model

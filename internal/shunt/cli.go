@@ -38,7 +38,7 @@ code-write
   --force               overwrite an existing target
 
 Common options
-  --provider NAME       ollama, openai, openai-compatible or openrouter
+  --provider NAME       ollama, openai, openai-compatible, openrouter or orcarouter
   --model NAME          override the configured model
   --max-output N        output token limit (bulk-read default 1024, code-write default 4096)
 `
@@ -76,6 +76,20 @@ func parseArgs(args []string, specs []flagSpec) (*parsedArgs, error) {
 	}
 	parsed := &parsedArgs{values: map[string]string{}, lists: map[string][]string{}, bools: map[string]bool{}, set: map[string]bool{}}
 	isOption := func(arg string) bool { return strings.HasPrefix(arg, "-") && arg != "-" }
+	// nextIsFlag reports whether arg looks like it's meant as the *next* option rather
+	// than this one's value: any --long option (even one we don't recognize), or a
+	// short option that is one of our own registered flags (e.g. -q for --question).
+	nextIsFlag := func(arg string) bool {
+		if !isOption(arg) {
+			return false
+		}
+		if strings.HasPrefix(arg, "--") {
+			return true
+		}
+		name, _, _ := strings.Cut(arg, "=")
+		_, known := lookup[name]
+		return known
+	}
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -103,7 +117,7 @@ func parseArgs(args []string, specs []flagSpec) (*parsedArgs, error) {
 		case flagString, flagInt:
 			value := inline
 			if !hasInline {
-				if i+1 >= len(args) || (isOption(args[i+1]) && spec.kind == flagString && strings.HasPrefix(args[i+1], "--")) {
+				if i+1 >= len(args) || (spec.kind == flagString && nextIsFlag(args[i+1])) {
 					return nil, usageError("option %s needs a value", name)
 				}
 				i++
@@ -127,13 +141,11 @@ func parseArgs(args []string, specs []flagSpec) (*parsedArgs, error) {
 				parsed.lists[key] = append(parsed.lists[key], inline)
 				continue
 			}
-			start := len(parsed.lists[key])
+			// Zero following values is allowed (matches the old CLI's nargs="*"):
+			// an empty list, not an error.
 			for i+1 < len(args) && !isOption(args[i+1]) {
 				i++
 				parsed.lists[key] = append(parsed.lists[key], args[i])
-			}
-			if len(parsed.lists[key]) == start {
-				return nil, usageError("option %s needs at least one value", name)
 			}
 		}
 	}

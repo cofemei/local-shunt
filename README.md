@@ -228,19 +228,31 @@ scripts/build.sh linux/amd64   # 只編譯目前的平台
 
 2. 提供 API 金鑰，以下三種方式擇一：
 
-   - 環境變數：`export OPENROUTER_API_KEY=<YOUR_API_KEY>`
-   - `.env` 檔：寫入 `~/.config/local-shunt/.env`，或在使用者設定中指定既有的檔案：
+   - 使用者設定檔：`api_keys` 的 key 要用 provider 名稱（不是變數名稱）。此檔案應設為只有自己可讀取（`chmod 600`）。
 
      ```json
      {
        "provider": "openrouter",
        "model": "nvidia/nemotron-3.5-lightning:free",
        "num_ctx": 131072,
-       "env_files": ["/path/to/apps/api/.env"]
+       "api_keys": {
+         "openrouter": "<YOUR_API_KEY>",
+         "orcarouter": "<YOUR_API_KEY>"
+       }
      }
      ```
 
-   - 使用者設定檔：`"api_keys": { "openrouter": "<YOUR_API_KEY>" }`。此檔案應設為只有自己可讀取（`chmod 600`）。
+   - 環境變數：`export OPENROUTER_API_KEY=<YOUR_API_KEY>`
+   - `.env` 檔：寫入 `~/.config/local-shunt/.env`，或在使用者設定中指定既有的檔案（可列多個，依序尋找）：
+
+     ```json
+     {
+       "provider": "openrouter",
+       "model": "nvidia/nemotron-3.5-lightning:free",
+       "num_ctx": 131072,
+       "env_files": ["/path/to/apps/api/.env", "/your_project_path/.env"]
+     }
+     ```
 
 3. 開啟新的工作階段。SessionStart 說明中應出現 `provider openrouter`，以及「檔案內容會送往 `https://openrouter.ai/api/v1`」的提示。
 
@@ -251,6 +263,7 @@ scripts/build.sh linux/amd64   # 只編譯目前的平台
 | 服務 | 設定 |
 |---|---|
 | OpenAI | `"provider": "openai"`，金鑰放在 `OPENAI_API_KEY` |
+| OrcaRouter | `"provider": "orcarouter"`，金鑰放在 `ORCAROUTER_API_KEY` |
 | LM Studio | `"provider": "openai-compatible"`、`"api_base": "http://127.0.0.1:1234/v1"` |
 | llama.cpp server | `"provider": "openai-compatible"`、`"api_base": "http://127.0.0.1:8080/v1"` |
 | Ollama 的 OpenAI 相容端點 | `"provider": "openai-compatible"`、`"api_base": "http://127.0.0.1:11434/v1"` |
@@ -753,7 +766,7 @@ Skill 告訴 Claude：
 
 | 設定鍵 | 環境變數 | 預設值 | 受信任 | 說明 |
 |---|---|---|---|---|
-| `provider` | `LOCAL_SHUNT_PROVIDER` | `ollama` | 是 | `ollama`、`openrouter`、`openai`、`openai-compatible` |
+| `provider` | `LOCAL_SHUNT_PROVIDER` | `ollama` | 是 | `ollama`、`openrouter`、`openai`、`openai-compatible`、`orcarouter` |
 | `model` | `LOCAL_SHUNT_MODEL` | `qwen2.5-coder:7b` | — | 模型名稱或 ID |
 | `ollama_host` | `OLLAMA_HOST` | `http://localhost:11434` | 是 | Ollama 服務位址。可省略協定與連接埠，例如 `127.0.0.1` |
 | `api_base` | `LOCAL_SHUNT_API_BASE` | 依 provider | 是 | OpenAI 相容 API 的基底網址；`openai-compatible` 必須設定 |
@@ -776,6 +789,7 @@ Provider 的預設值：
 | `ollama` | 不使用，改用 `ollama_host` | 不使用 |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `orcarouter` | `https://api.orcarouter.ai/v1` | `ORCAROUTER_API_KEY` |
 | `openai-compatible` | 必須設定 | 空白，表示不送金鑰 |
 
 ### API 金鑰的解析順序

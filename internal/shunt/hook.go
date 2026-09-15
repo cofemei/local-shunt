@@ -57,9 +57,9 @@ func positiveInt(value any) int {
 	return max(n, 0)
 }
 
-// bashRead is a simple single-file read command.
+// bashRead is a simple read command over one or more file arguments.
 type bashRead struct {
-	path     string
+	paths    []string
 	maxLines int // -1 means the whole file
 	maxBytes int // -1 means no byte limit
 }
@@ -95,7 +95,9 @@ func parseCount(value string) (int, bool) {
 	return n, err == nil
 }
 
-// parseBashRead recognizes simple single-file read commands. Anything else returns nil.
+// parseBashRead recognizes simple read commands over literal file arguments (which may
+// be glob patterns; the caller expands those against the filesystem). Anything else
+// returns nil.
 func parseBashRead(command string) *bashRead {
 	if strings.ContainsAny(command, shellMeta) {
 		return nil
@@ -116,10 +118,10 @@ func parseBashRead(command string) *bashRead {
 				files = append(files, a)
 			}
 		}
-		if len(files) != 1 {
+		if len(files) == 0 {
 			return nil
 		}
-		return &bashRead{path: files[0], maxLines: -1, maxBytes: -1}
+		return &bashRead{paths: files, maxLines: -1, maxBytes: -1}
 	}
 	if prog != "head" && prog != "tail" {
 		return nil
@@ -173,10 +175,10 @@ func parseBashRead(command string) *bashRead {
 			return nil
 		}
 	}
-	if len(files) != 1 {
+	if len(files) == 0 {
 		return nil
 	}
-	return &bashRead{path: files[0], maxLines: lines, maxBytes: nbytes}
+	return &bashRead{paths: files, maxLines: lines, maxBytes: nbytes}
 }
 
 func resolveHookPath(path, cwd string) string {
@@ -185,6 +187,29 @@ func resolveHookPath(path, cwd string) string {
 		path = filepath.Join(cwd, path)
 	}
 	return path
+}
+
+// hasGlobMeta reports whether path contains shell glob metacharacters.
+func hasGlobMeta(path string) bool {
+	return strings.ContainsAny(path, "*?[")
+}
+
+// expandGlobPaths resolves one bash argument to the file(s) it names. A literal
+// argument resolves to itself. A glob pattern is expanded with filepath.Glob; when it
+// matches nothing, the pattern is returned unchanged, mirroring bash's default
+// (non-nullglob) behavior of passing an unmatched pattern through literally, which then
+// fails to stat and is allowed as "not-found" — same outcome as today, just by the same
+// path a real shell would take.
+func expandGlobPaths(raw, cwd string) []string {
+	resolved := resolveHookPath(raw, cwd)
+	if !hasGlobMeta(raw) {
+		return []string{resolved}
+	}
+	matches, err := filepath.Glob(resolved)
+	if err != nil || len(matches) == 0 {
+		return []string{resolved}
+	}
+	return matches
 }
 
 func hookDisplayPath(path, base string) string {
@@ -282,12 +307,12 @@ func decide(event map[string]any, cfg Config, health func() Health) *Decision {
 	base := ProjectDir(cwd)
 
 	var (
-		pathStr string
-		partial *bashRead
+		pathStrs []string
+		partial  *bashRead
 	)
 	switch tool {
 	case "Read":
-		pathStr = asString(input["file_path"])
+		pathStr := asString(input["file_path"])
 		if pathStr == "" {
 			return nil
 		}
@@ -297,6 +322,7 @@ func decide(event map[string]any, cfg Config, health func() Health) *Decision {
 		if input["offset"] != nil || input["limit"] != nil {
 			return rangeDecision(resolveHookPath(pathStr, cwd), input, cfg)
 		}
+		pathStrs = []string{pathStr}
 	case "Bash":
 		if !cfg.InterceptBash {
 			return nil
@@ -308,12 +334,28 @@ func decide(event map[string]any, cfg Config, health func() Health) *Decision {
 		if !cfg.Enabled {
 			return &Decision{Allow: true, Rule: "disabled"}
 		}
-		pathStr = partial.path
+		pathStrs = partial.paths
 	default:
 		return nil
 	}
 
-	path := resolveHookPath(pathStr, cwd)
+	// Evaluate every argument (a bash command may name several files, and each may be
+	// a glob pattern); deny as soon as any one of them would exceed the threshold.
+	var last *Decision
+	for _, raw := range pathStrs {
+		for _, path := range expandGlobPaths(raw, cwd) {
+			d := evaluatePath(path, partial, cfg, base, cwd, tool, health)
+			if !d.Allow {
+				return d
+			}
+			last = d
+		}
+	}
+	return last
+}
+
+// evaluatePath applies the size/exclusion/threshold checks to one resolved file path.
+func evaluatePath(path string, partial *bashRead, cfg Config, base, cwd, tool string, health func() Health) *Decision {
 	if nativeExtensions[strings.ToLower(filepath.Ext(path))] {
 		return &Decision{Allow: true, Rule: "native-type"}
 	}

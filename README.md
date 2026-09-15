@@ -1,6 +1,6 @@
 # local-shunt
 
-local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改由 worker 模型閱讀檔案，只把回答問題所需的精簡摘要回傳給 Claude，以減少 Claude 的輸入代幣。
+local-shunt 是一個 Claude Code plugin。它攔截大型檔案的讀取，改由 worker 模型閱讀檔案，只把回答問題所需的精簡摘要回傳給 Claude，以減少 Claude 的輸入代幣。它的 worker 也能以 MCP server 形式供 Codex CLI 使用。
 
 Worker 模型預設使用本機 Ollama，也可以改用 OpenAI 相容 API，例如 OpenRouter、OpenAI、LM Studio、llama.cpp 或 vLLM。
 
@@ -29,6 +29,7 @@ code-write --spec "Generate a config stub" --reference config/existing.yaml
 - [為什麼做成 Plugin](#為什麼做成-plugin)
 - [系統需求](#系統需求)
 - [安裝](#安裝)
+- [Codex CLI](#codex-cli)
 - [使用外部 API](#使用外部-api)
 - [目錄結構](#目錄結構)
 - [元件規格](#元件規格)
@@ -113,6 +114,8 @@ Hook 本身不呼叫模型，也不連線遠端服務，因此不會拖慢一般
   - OpenAI 相容 API 的端點與金鑰，見[使用外部 API](#使用外部-api)
 
 ## 安裝
+
+本節說明 Claude Code plugin 的安裝方式。
 
 1. 安裝 Ollama 並下載預設模型：
 
@@ -210,6 +213,25 @@ scripts/build.sh linux/amd64   # 只編譯目前的平台
 
 不在 Claude Code 中時，也可以直接執行 `bin/bulk-read`、`bin/code-write` 或 `bin/local-shunt`；把 `bin/` 加入 `PATH` 後即可省略路徑。
 
+## Codex CLI
+
+local-shunt 同時提供 Claude Code 與 Codex CLI 的 plugin 封裝。兩者使用相同的 worker、設定檔與 skills；各自使用適用的 manifest、MCP 設定與 hook 設定。
+
+在 Codex CLI 中安裝 marketplace：
+
+```bash
+codex plugin marketplace add cofemei/local-shunt
+codex plugin add local-shunt@local-shunt
+```
+
+開發本 repository 時，將第一行改成 `codex plugin marketplace add .`。
+
+安裝後開啟新的 Codex 工作階段。plugin 會載入 `shunt_read`、`shunt_write` 與 `shunt_stats` MCP 工具、`bulk-reader` 與 `code-writer` skills，以及大型讀取的 `PreToolUse` hook。
+
+`bulk-read` 與 `code-write` 也可直接執行。若要讓 Codex 透過 shell 呼叫它們，請將此 repository 的 `bin/` 加到 `PATH`，或在指令中使用完整路徑。
+
+Codex 準備完整讀取超過門檻的文字檔時，`PreToolUse` hook 會拒絕該次讀取並指示它改呼叫 `shunt_read`。若 worker 不可用，hook 會放行原始讀取。Codex 仍可主動呼叫 `shunt_read`，或執行 `bulk-read --question ... --paths ...`。
+
 ## 使用外部 API
 
 外部 API 適合沒有 GPU 的機器，或需要比本機模型更大的上下文與更好的品質時使用。**檔案內容會送往該服務**，使用前應確認服務商的資料保留政策。
@@ -275,6 +297,8 @@ scripts/build.sh linux/amd64   # 只編譯目前的平台
 
 ```text
 local-shunt/
+├── .agents/plugins/
+│   └── marketplace.json       # Codex marketplace 定義
 ├── .claude-plugin/
 │   ├── plugin.json            # plugin 中繼資料
 │   └── marketplace.json       # marketplace 定義，供使用者從 GitHub 安裝
@@ -287,6 +311,14 @@ local-shunt/
 ├── .gitleaks.toml             # gitleaks 規則
 ├── hooks/
 │   └── hooks.json             # PreToolUse 與 SessionStart hook
+├── codex-marketplace/
+│   └── plugins/local-shunt/   # Codex 可獨立安裝的 plugin package
+│       ├── .codex-plugin/plugin.json
+│       ├── .mcp.json          # Codex 格式的 MCP server 設定
+│       ├── hooks.json         # Codex 的 PreToolUse 與 SessionStart hook
+│       ├── skills/            # Codex 專用的 bulk-reader 與 code-writer skills
+│       ├── bin/               # 與根目錄相同的啟動腳本
+│       └── dist/              # 與根目錄相同的跨平台執行檔
 ├── skills/
 │   ├── bulk-reader/
 │   │   └── SKILL.md           # 何時、如何委託讀取
@@ -934,7 +966,7 @@ Provider 的預設值：
 - **遠端設定錯誤發現得較晚**：Hook 不連線遠端端點。若 SessionStart 檢查之後服務才失效，hook 仍會攔截，worker 失敗後 Claude 必須自行改用 `offset`/`limit`。
 - **Bash 攔截不完整**：只涵蓋簡單形式，Claude 仍能以管線或其他指令讀取完整檔案。
 - **`stats` 的節省比例為估計值**：以字元數估算，也沒有計入額外的來回。Claude 實際計費的代幣數以 `usage` 或 `bench` 量測。
-- **Repository 體積**：`dist/` 內含 6 個平台的執行檔，每個約 7 MB。每次重新編譯並提交，git 歷史約增加 20–40 MB。
+- **Repository 體積**：Claude 與 Codex package 各自內含 6 個平台的執行檔，每個約 7 MB。每次重新編譯並提交，git 歷史約增加 40–80 MB。
 - **Windows**：hook 與 `bulk-read` 經由 Claude Code 使用的 Git Bash 執行 `bin/` 中的 shell 腳本。未在 Windows 上實測。
 
 ## 測試與驗收
@@ -947,7 +979,7 @@ go test ./...
 
 測試不需要 Ollama、網路或 API 金鑰。`internal/shunt/helpers_test.go` 為每項測試建立獨立的專案、設定與紀錄目錄，清除相關環境變數，並提供模擬 Ollama 與 OpenAI 相容 API 的本機 HTTP 伺服器。對照測試以測試執行檔本身模擬 `claude`。
 
-GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每個 pull request 時，以 `claude plugin validate --strict` 驗證 plugin 與 marketplace 的定義，在 Ubuntu、macOS 與 Windows 上執行上述測試，編譯所有平台的執行檔，並以啟動腳本實際執行 hook。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
+GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每個 pull request 時，以 `claude plugin validate --strict` 驗證 Claude plugin，檢查 Codex package 的 JSON、目錄與跨平台執行檔，在 Ubuntu、macOS 與 Windows 上執行上述測試，編譯所有平台的執行檔，並以啟動腳本實際執行 hook。`bench` 需要 Claude API 並產生費用，不在 CI 中執行。
 
 | 檔案 | 測試數 | 涵蓋範圍 |
 |---|---|---|
@@ -956,7 +988,7 @@ GitHub Actions 的 `.github/workflows/test.yml` 在每次 push 到 `main` 與每
 | `providers_test.go` | 24 | 兩種 provider 的請求內容、關閉推理與自動移除、重試與放棄、錯誤訊息、健康檢查與快取 |
 | `worker_test.go` | 31 | Chunking 覆蓋每一行、行號驗證、diff 行號、`bulk-read` 的單次與 map-reduce 流程、`code-write` 的拒絕條件與 stdout 輸出、stats、CLI exit code |
 | `outline_test.go` | 6 | 各語言的大綱、區塊範圍、長度上限 |
-| `mcp_test.go` | 9 | 初始化、工具清單與 `alwaysLoad`、工具呼叫、參數驗證與容錯、錯誤回報、伺服器在錯誤訊息後繼續運作 |
+| `mcp_test.go` | 10 | 初始化、工具清單與 `alwaysLoad`、Claude 與 Codex 的相對路徑、工具呼叫、參數驗證與容錯、錯誤回報、伺服器在錯誤訊息後繼續運作 |
 | `measure_test.go` | 17 | Transcript 去除重複與加總、subagent、工具分類與拒絕偵測、worker 紀錄的 session ID、任務檔驗證、以模擬的 `claude` 執行對照測試與報表 |
 
 從 Python 版改寫時，以兩個版本對 7 個檔案（包含 2,676 行的 `argparse.py`）產生大綱，輸出逐位元組相同。

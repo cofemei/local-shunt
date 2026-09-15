@@ -128,8 +128,11 @@ var envMap = [][2]string{
 	{"num_ctx", "LOCAL_SHUNT_NUM_CTX"},
 }
 
-// ProjectDir is the Claude Code project directory, else cwd, else the working directory.
+// ProjectDir is the host project's directory, else cwd, else the working directory.
 func ProjectDir(cwd string) string {
+	if dir := os.Getenv("CODEX_PROJECT_DIR"); dir != "" {
+		return dir
+	}
 	if dir := os.Getenv("CLAUDE_PROJECT_DIR"); dir != "" {
 		return dir
 	}

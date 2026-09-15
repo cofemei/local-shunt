@@ -1,0 +1,20 @@
+{
+  "name": "local-shunt",
+  "interface": {
+    "displayName": "local-shunt"
+  },
+  "plugins": [
+    {
+      "name": "local-shunt",
+      "source": {
+        "source": "local",
+        "path": "./codex-marketplace/plugins/local-shunt"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "local-shunt",
+  "version": "0.4.0",
+  "description": "Delegate large file reads to a local or compatible worker model to reduce context use.",
+  "author": {
+    "name": "cofemei",
+    "url": "https://github.com/cofemei"
+  },
+  "homepage": "https://github.com/cofemei/local-shunt",
+  "repository": "https://github.com/cofemei/local-shunt",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["ollama", "openrouter", "tokens", "hooks", "mcp", "local-llm"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "local-shunt",
+    "shortDescription": "Delegate large file reads to a worker model.",
+    "longDescription": "Use a local Ollama model or an OpenAI-compatible API to answer focused questions about large files without loading their full contents into the coding agent context.",
+    "developerName": "cofemei",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/cofemei/local-shunt",
+    "defaultPrompt": "Use local-shunt to identify the public methods in this large source file."
+  }
+}

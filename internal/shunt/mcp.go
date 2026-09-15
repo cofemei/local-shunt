@@ -320,7 +320,11 @@ func handleMessage(message map[string]any) any {
 
 // RunMCP serves the MCP protocol until stdin closes.
 func RunMCP(stdin io.Reader, stdout io.Writer) int {
-	if project := os.Getenv("CLAUDE_PROJECT_DIR"); project != "" {
+	project := os.Getenv("CODEX_PROJECT_DIR")
+	if project == "" {
+		project = os.Getenv("CLAUDE_PROJECT_DIR")
+	}
+	if project != "" {
 		if stat, err := os.Stat(project); err == nil && stat.IsDir() {
 			_ = os.Chdir(project) // resolve relative paths against the project
 		}

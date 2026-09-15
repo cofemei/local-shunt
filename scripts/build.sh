@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the local-shunt binaries that bin/local-shunt runs, for every supported platform.
+# Build the local-shunt binaries for the Claude Code and Codex plugin packages.
 # Usage: scripts/build.sh [os/arch ...]   (default: all platforms)
 set -eu
 
@@ -13,4 +13,9 @@ for platform in $platforms; do
     [ "$os" = windows ] && out=$out.exe
     echo "building $out"
     CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -ldflags "-s -w" -o "$out" ./cmd/local-shunt
+    codex_out=codex-marketplace/plugins/local-shunt/$out
+    mkdir -p "${codex_out%/*}"
+    cp "$out" "$codex_out"
 done
+
+cp bin/local-shunt bin/bulk-read bin/code-write codex-marketplace/plugins/local-shunt/bin/

@@ -143,6 +143,16 @@ func TestMCPRelativePathsUseProjectDir(t *testing.T) {
 	contain(t, text, "rel.py (10 lines)")
 }
 
+func TestMCPRelativePathsUseCodexProjectDir(t *testing.T) {
+	e, _ := mcpEnv(t)
+	t.Setenv("CODEX_PROJECT_DIR", e.dir)
+	e.make("codex-rel.py", 10)
+	c := startMCP(t)
+	text, isError := c.call("shunt_read", map[string]any{"files": []string{"codex-rel.py"}, "question": "q"})
+	equal(t, isError, false)
+	contain(t, text, "codex-rel.py (10 lines)")
+}
+
 func TestMCPErrorsAreToolErrors(t *testing.T) {
 	mcpEnv(t)
 	c := startMCP(t)

@@ -3,7 +3,7 @@
     "local-shunt": {
       "command": "./bin/local-shunt",
       "args": ["mcp"],
-      "cwd": "${PLUGIN_ROOT}"
+      "cwd": "."
     }
   }
 }

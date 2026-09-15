@@ -15,7 +15,7 @@ import (
 )
 
 // Version is reported by the MCP server and `local-shunt version`.
-const Version = "0.4.1"
+const Version = "0.4.2"
 
 var defaultExclude = []string{
 	"**/CLAUDE.md",
